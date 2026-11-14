@@ -2,7 +2,6 @@ import base64
 import json
 import math
 from concurrent.futures import ThreadPoolExecutor
-from itertools import combinations
 from pathlib import Path
 from threading import Lock, Thread
 from time import monotonic, sleep
@@ -190,70 +189,75 @@ def field_at(x, y):
     return f"{' SDT'[factor]}{sector}", factor * sector
 
 
-def axes(mask, transform):
-    # Changed straight edges generate candidates; matching views constrain the impact.
+def axes(mask, mapping):
+    # In both mounted camera views the flight is above the tip. Use the
+    # silhouette's width along each near-vertical edge to find the taper.
     edges = cv2.Canny(mask, 40, 100)
-    segments = cv2.HoughLinesP(edges, 1, np.pi / 180, 32,
-                               minLineLength=55, maxLineGap=15)
+    scale = mask.shape[0] / 1536
+    segments = cv2.HoughLinesP(edges, 1, np.pi / 180, 24,
+                               minLineLength=max(18, round(40 * scale)),
+                               maxLineGap=max(5, round(12 * scale)))
     if segments is None:
         return []
     segments = segments.reshape(-1, 2, 2)
     lengths = np.linalg.norm(segments[:, 1] - segments[:, 0], axis=1)
     result = []
-    for index in np.argsort(lengths)[-14:][::-1]:
-        segment = segments[index]
-        a, b = project(segment[None].astype(np.float32), transform)[0]
-        direction = b - a
-        norm = np.linalg.norm(direction)
-        if norm > 0.01 and np.isfinite(norm):
-            result.append((a, direction / norm, float(lengths[index]), segment))
+    along = np.arange(-75, 125, 2, dtype=np.float32) * scale
+    across = np.arange(-16, 17, dtype=np.float32) * scale
+    for index in np.argsort(lengths)[-70:][::-1]:
+        top, bottom = sorted(segments[index], key=lambda point: point[1])
+        direction = (bottom - top) / lengths[index]
+        if direction[1] < .78:
+            continue
+        normal = np.array([direction[1], -direction[0]])
+        grid = bottom + along[:, None, None] * direction + across[None, :, None] * normal
+        profile = cv2.remap(mask, grid[:, :, 0].astype(np.float32),
+                            grid[:, :, 1].astype(np.float32), cv2.INTER_NEAREST) > 0
+        # A barrel has support on several adjacent cross-sections. The
+        # support narrows at the point and disappears beyond the board entry.
+        width = profile.sum(axis=1)
+        central = profile[:, 7:26].any(axis=1)
+        for tip_index in range(20, len(along) - 8):
+            body = width[tip_index-20:tip_index-6]
+            tip_width = width[tip_index-4:tip_index+1]
+            if (np.count_nonzero((body >= 5) & (body <= 26)) < 9
+                    or np.count_nonzero(central[tip_index-4:tip_index+1]) < 3
+                    or np.median(tip_width) > .75 * np.median(body)
+                    or np.count_nonzero(central[tip_index+1:tip_index+9]) > 1):
+                continue
+            tip_columns = np.where(profile[tip_index-4:tip_index+1, 7:26])[1] + 7
+            tip = grid[tip_index, 16] + np.median(across[tip_columns]) * normal
+            body_center = grid[tip_index-17, 16]
+            body_columns = np.where(profile[tip_index-20:tip_index-6])[1]
+            start = body_center + np.median(across[body_columns]) * normal
+            board_tip = project(np.float32([[tip]]), mapping)[0, 0]
+            if np.isfinite(board_tip).all() and field_at(*board_tip)[0] != "MISS":
+                result.append((board_tip, start))
     return result
 
 
-def detect(masks, transforms, diagnostics=None, near=None):
-    lines = [axes(mask, transform) for mask, transform in zip(masks, transforms)]
+def detect(masks, transforms, diagnostics=None):
+    views = [axes(mask, mapping) for mask, mapping in zip(masks, transforms)]
     if diagnostics is not None:
-        diagnostics["line_counts"] = [len(view) for view in lines]
-
-    inverses = transforms
-    candidates = {}
-    for left, right in combinations(range(len(lines)), 2):
-        for a, u, length_a, segment_a in lines[left]:
-            for b, v, length_b, segment_b in lines[right]:
-                system = np.column_stack((u, -v))
-                if abs(np.linalg.det(system)) < 0.22:
-                    continue
-                hit = a + np.linalg.solve(system, b - a)[0] * u
-                if near is not None and np.linalg.norm(hit - near) > 18:
-                    continue
-                field, points = field_at(*hit)
-                if field == "MISS":
-                    continue
-                supporting = set()
-                for index, (mask, inverse) in enumerate(zip(masks, inverses)):
-                    point = project(hit.reshape(1, 1, 2), inverse, backwards=True)[0, 0]
-                    x, y = np.rint(point).astype(int)
-                    if (0 <= x < mask.shape[1] and 0 <= y < mask.shape[0]
-                        and mask[max(0, y-10):y+11, max(0, x-10):x+11].any()):
-                        supporting.add(index)
-                if left not in supporting or right not in supporting:
-                    continue
-                key = tuple(np.rint(hit / 3).astype(int))
-                weight = (length_a + length_b) * (1 + .3 * (len(supporting) - 2))
-                if key not in candidates or weight > candidates[key][0]:
-                    candidates[key] = (weight, hit, field, points, {left: segment_a, right: segment_b})
-    if not candidates:
+        diagnostics["tip_counts"] = [len(view) for view in views]
+    if not all(views):
         return None
-
-    _, hit, field, points, segments = max(candidates.values(), key=lambda candidate: candidate[0])
+    left, right = views
+    left_points = np.array([candidate[0] for candidate in left], dtype=np.float32)
+    right_points = np.array([candidate[0] for candidate in right], dtype=np.float32)
+    distances = np.linalg.norm(left_points[:, None] - right_points, axis=2)
+    left_index, right_index = np.unravel_index(distances.argmin(), distances.shape)
+    if distances[left_index, right_index] > 9:
+        return None
+    hit = (left_points[left_index] + right_points[right_index]) / 2
+    field, points = field_at(*hit)
     lines_by_view = []
-    for index, mapping in enumerate(transforms):
-        tip = project(hit.reshape(1, 1, 2), mapping, backwards=True)[0, 0]
-        segment = segments[index]
-        start = segment[np.argmax(np.linalg.norm(segment - tip, axis=1))]
-        lines_by_view.append({"start": start.tolist(), "tip": tip.tolist()})
+    for mapping, (_, start) in zip(transforms, (left[left_index], right[right_index])):
+        pixel = project(hit.reshape(1, 1, 2), mapping, backwards=True)[0, 0]
+        lines_by_view.append({"start": start.tolist(), "tip": pixel.tolist()})
     return {"field": field, "points": points,
-            "x_mm": round(float(hit[0]), 1), "y_mm": round(float(hit[1]), 1), "camera_lines": lines_by_view}
+            "x_mm": round(float(hit[0]), 1), "y_mm": round(float(hit[1]), 1),
+            "camera_lines": lines_by_view}
 
 
 def change_mask(previous, current):
@@ -271,8 +275,8 @@ def detect_throw(before, after, mappings):
     hit = detect(masks, mappings, diagnostics)
     if hit is not None:
         return hit
-    counts = "/".join(map(str, diagnostics["line_counts"]))
-    raise ValueError(f"Fandt intet fælles træfpunkt. Linjer pr. kamera: {counts}.")
+    counts = "/".join(map(str, diagnostics["tip_counts"]))
+    raise ValueError(f"Fandt ingen pilespidser, der stemmer overens. Kandidater pr. kamera: {counts}.")
 
 
 def camera_selection():
