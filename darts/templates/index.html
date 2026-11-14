@@ -35,7 +35,7 @@ canvas{display:block;width:100%;height:auto;cursor:crosshair;margin-bottom:14px}
 <figure><figcaption>Venstre kamera</figcaption><div class="camera-frame"><img id="left" alt="Venstre kamerabillede"><canvas id="leftOverlay" hidden></canvas></div></figure>
 <figure><figcaption>Højre kamera</figcaption><div class="camera-frame"><img id="right" alt="Højre kamerabillede"><canvas id="rightOverlay" hidden></canvas></div></figure>
 {% if third_camera %}
-<figure><figcaption>Kamera 3</figcaption><img id="third" alt="RTSP-kamerabillede"></figure>
+<figure><figcaption>Kamera 3</figcaption><div class="camera-frame"><img id="third" alt="RTSP-kamerabillede"><canvas id="thirdOverlay" hidden></canvas></div></figure>
 {% endif %}
 </div>
 <dialog id="zoom">
@@ -48,6 +48,10 @@ canvas{display:block;width:100%;height:auto;cursor:crosshair;margin-bottom:14px}
 <script>
 const get = id => document.getElementById(id);
 const sides = ["left", "right"];
+if (get("third")) sides.push("third");
+const cameraNames = {left: "Venstre kamera", right: "Højre kamera", third: "Kamera 3"};
+const completed = () => points && sides.every(side => points[side].length === labels.length);
+const stepIndex = () => Math.min(...sides.map(side => points[side].length));
 const wires = ["5/20", "13/6", "17/3", "8/11"];
 const labels = [
   ...wires.map(wire => "Inderste dobbeltwire " + wire),
@@ -66,7 +70,7 @@ const canvas = get("crop");
 const context = canvas.getContext("2d");
 function controls() {
   get("reset").disabled = busy || !!points;
-  const reviewing = editing === null && points?.left.length === labels.length && points?.right.length === labels.length;
+  const reviewing = editing === null && completed();
   get("review").hidden = !reviewing;
   get("saveCalibration").disabled = busy || !overlayReady;
   get("redoPoint").disabled = busy;
@@ -76,8 +80,6 @@ function controls() {
   get("calibrate").textContent = points ? "Afbryd kalibrering" : "Kalibrér";
 }
 async function refresh() {
-  const third = get("third");
-  if (third && !points) third.src = "image/third?t=" + Date.now();
   await Promise.all(sides.map(side => new Promise((resolve, reject) => {
     const img = get(side);
     img.onload = resolve;
@@ -124,9 +126,9 @@ async function poll() {
 }
 
 function prompt() {
-  const step = editing?.index ?? Math.min(points.left.length, points.right.length);
+  const step = editing?.index ?? stepIndex();
   get("status").textContent = (step + 1) + "/" + labels.length + ": " +
-    labels[step] + ". Markér punktet i begge billeder.";
+    labels[step] + ". Markér punktet i alle kamerabilleder.";
 }
 get("reset").onclick = () => run(() => action("reset"));
 get("refresh").onclick = () => run(refresh);
@@ -144,7 +146,7 @@ get("autoCalibrate").onclick = () => run(async () => {
   await previewCalibration(true);
 });
 get("calibrate").onclick = () => run(async () => {
-  points = points ? null : {left:[], right:[]};
+  points = points ? null : Object.fromEntries(sides.map(side => [side, []]));
   editing = null;
   hideOverlay();
   get("status").textContent = "";
@@ -155,8 +157,7 @@ get("calibrate").onclick = () => run(async () => {
 });
 for (const side of sides) get(side).onclick = event => {
   if (!points || busy || (editing ? editing.done.has(side) : points[side].length === labels.length)) return;
-  const other = side === "left" ? "right" : "left";
-  if (!editing && points[side].length > points[other].length) return;
+  if (!editing && points[side].length > stepIndex()) return;
   const img = event.currentTarget;
   if (!img.naturalWidth) return;
   const rect = img.getBoundingClientRect();
@@ -169,7 +170,7 @@ for (const side of sides) get(side).onclick = event => {
     y: Math.max(0, Math.min(y - size / 2, img.naturalHeight - size))
   };
   get("zoomTitle").textContent = labels[editing?.index ?? points[side].length] + " · " +
-    (side === "left" ? "Venstre kamera" : "Højre kamera");
+    cameraNames[side];
   drawCrop();
   get("zoom").showModal();
 };
@@ -209,10 +210,10 @@ get("confirm").onclick = () => {
     points[side].push(point);
   }
   get("zoom").close();
-  if (!editing && points.left.length === labels.length && points.right.length === labels.length) {
+  if (!editing && completed()) {
     run(previewCalibration);
-  } else if (!editing && points.left.length === points.right.length) prompt();
-  else get("status").textContent = "Vælg og bekræft samme punkt i det andet billede.";
+  } else if (!editing && sides.every(side => points[side].length === stepIndex())) prompt();
+  else get("status").textContent = "Vælg og bekræft samme punkt i de resterende billeder.";
 };
 function hideOverlay() {
   overlayReady = false;
@@ -254,7 +255,7 @@ async function previewCalibration(automatic = false) {
   overlayReady = true;
   const worst = side => Math.max(...data.errors[side]).toFixed(1);
   get("status").textContent = "Sammenlign de blå wirer og tal med skiven. Største afvigelse: venstre " +
-    worst("left") + " px, højre " + worst("right") + " px.";
+    sides.map(side => cameraNames[side] + " " + worst(side) + " px").join(", ") + ".";
   if (automatic) get("status").textContent = "Automatisk forslag. Kontrollér de blå wirer og tal, før du gemmer.";
   const combined = labels.map((_, index) => Math.max(...sides.map(side => data.errors[side][index])));
   get("editPoint").selectedIndex = combined.indexOf(Math.max(...combined));

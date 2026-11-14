@@ -69,3 +69,7 @@ brokerens kvittering for pointværdien.
 
 Tilføj eventuelt en RTSP-adresse i `third_camera_url` i appens konfiguration.
 Kamera 3 vises i appen som løbende opdaterede billeder uden lyd.
+
+Når kamera 3 er konfigureret, skal alle tre kameraer kalibreres manuelt
+én gang. Alle tre indgår derefter i auto-kalibrering og kastdetektion.
+Skiven og alle ni kalibreringspunkter skal være synlige i RTSP-billedet.

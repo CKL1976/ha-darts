@@ -2,6 +2,7 @@ import base64
 import json
 import math
 from concurrent.futures import ThreadPoolExecutor
+from itertools import combinations
 from pathlib import Path
 from threading import Lock, Thread
 from time import sleep
@@ -56,8 +57,8 @@ def capture(side):
 
 
 def capture_pair():
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        return list(pool.map(capture, sides))
+    with ThreadPoolExecutor(max_workers=len(cameras)) as pool:
+        return list(pool.map(capture, cameras))
 
 
 def board_points(indices, radius, offset=0):
@@ -161,45 +162,38 @@ def colors_at(hit, before, inverses):
 
 
 def detect(masks, transforms, diagnostics=None, before=None):
-    left_axes, right_axes = [axes(mask, transform)
-                            for mask, transform in zip(masks, transforms)]
+    lines = [axes(mask, transform) for mask, transform in zip(masks, transforms)]
     if diagnostics is not None:
-        diagnostics["changed_pixels"] = [cv2.countNonZero(mask) for mask in masks]
-        diagnostics["line_counts"] = [len(left_axes), len(right_axes)]
+        diagnostics["line_counts"] = [len(view) for view in lines]
 
     inverses = [np.linalg.inv(transform) for transform in transforms]
     candidates = {}
-    for a, u, length_a in left_axes:
-        for b, v, length_b in right_axes:
-            system = np.column_stack((u, -v))
-            if abs(np.linalg.det(system)) < 0.22:
-                continue
-            distance, _ = np.linalg.solve(system, b - a)
-            hit = a + distance * u
-            if np.linalg.norm(hit) > 185:
-                continue
-            # The impact should be near changed pixels in both original images.
-            for mask, inverse in zip(masks, inverses):
-                point = cv2.perspectiveTransform(hit.reshape(1, 1, 2),
-                                                 inverse)[0, 0]
-                x, y = np.rint(point).astype(int)
-                if not (0 <= x < mask.shape[1] and 0 <= y < mask.shape[0]):
-                    break
-                if not np.any(mask[max(0, y-10):y+11, max(0, x-10):x+11]):
-                    break
-            else:
+    for left, right in combinations(range(len(lines)), 2):
+        for a, u, length_a in lines[left]:
+            for b, v, length_b in lines[right]:
+                system = np.column_stack((u, -v))
+                if abs(np.linalg.det(system)) < 0.22:
+                    continue
+                hit = a + np.linalg.solve(system, b - a)[0] * u
                 field, points = field_at(*hit)
-                if field != "MISS":
-                    key = tuple(np.rint(hit / 3).astype(int))
-                    weight = length_a + length_b
-                    if key not in candidates or weight > candidates[key][0]:
-                        candidates[key] = (weight, hit, field, points)
+                if field == "MISS":
+                    continue
+                supporting = set()
+                for index, (mask, inverse) in enumerate(zip(masks, inverses)):
+                    point = cv2.perspectiveTransform(hit.reshape(1, 1, 2), inverse)[0, 0]
+                    x, y = np.rint(point).astype(int)
+                    if (0 <= x < mask.shape[1] and 0 <= y < mask.shape[0]
+                        and mask[max(0, y-10):y+11, max(0, x-10):x+11].any()):
+                        supporting.add(index)
+                if left not in supporting or right not in supporting:
+                    continue
+                key = tuple(np.rint(hit / 3).astype(int))
+                weight = (length_a + length_b) * (1 + .3 * (len(supporting) - 2))
+                if key not in candidates or weight > candidates[key][0]:
+                    candidates[key] = (weight, hit, field, points)
     if not candidates:
-        if diagnostics is not None:
-            diagnostics["reason"] = ("no_lines_in_one_or_both_views"
-                                     if not left_axes or not right_axes
-                                     else "no_supported_intersection")
         return None
+
     def rank(candidate):
         weight, hit, field, _ = candidate
         colors = colors_at(hit, before, inverses) if before is not None else []
@@ -224,9 +218,9 @@ def detect_throw(before, after, mappings, board):
     if hit is not None:
         return hit
 
-    left, right = diagnostics["line_counts"]
+    counts = "/".join(map(str, diagnostics["line_counts"]))
     raise ValueError(
-        f"Fandt intet fælles træfpunkt. Linjer i venstre/højre billede: {left}/{right}."
+        f"Fandt intet fælles træfpunkt. Linjer pr. kamera: {counts}."
     )
 
 
@@ -382,14 +376,16 @@ def auto_calibrate():
             saved = json.loads(calibration_path.read_text()) if calibration_path.exists() else None
         if saved is None:
             raise ValueError("Gem først en manuel kalibrering, så appen kender skivens retning.")
+        if any(side not in saved for side in cameras):
+            raise ValueError("Kalibrér alle tilsluttede kameraer manuelt én gang først.")
         radius = double_inner if saved and saved.get("ring") == "inner_double" else double_outer
         proposal, images = {}, {}
-        for side, frame in zip(sides, frames):
+        for side, frame in zip(cameras, frames):
             initial = transform(saved[side], radius)
             try:
                 fitted = refine_calibration(frame, initial)
             except ValueError as exc:
-                name = "Venstre kamera" if side == "left" else "Højre kamera"
+                name = {"left": "Venstre kamera", "right": "Højre kamera", "third": "Kamera 3"}[side]
                 raise ValueError(f"{name}: {exc}") from exc
             anchors = np.vstack((
                 board_points([sectors.index(n) for n in anchor_sectors], double_inner, -sector_angle / 2),
@@ -420,7 +416,7 @@ def calibration_preview():
         labels = {}
         overlay = {}
         errors = {}
-        for side in sides:
+        for side in cameras:
             inverse = np.linalg.inv(transform(data[side], radius=double_inner))
             source, target = calibration_geometry(data[side], double_inner)
             projected = cv2.perspectiveTransform(target[None], inverse)[0]
@@ -444,7 +440,7 @@ def act(action):
         try:
             if action == "calibrate":
                 data = request.get_json()
-                points = {side: data[side] for side in sides}
+                points = {side: data[side] for side in cameras}
                 for coordinates in points.values():
                     transform(coordinates, radius=double_inner)
                 temp = calibration_path.with_suffix(".tmp")
@@ -457,7 +453,9 @@ def act(action):
                     raise ValueError("Kalibrér kameraerne først.")
                 points = json.loads(calibration_path.read_text())
                 radius = double_inner if points.get("ring") == "inner_double" else double_outer
-                new_mappings = [transform(points[side], radius) for side in sides]
+                if any(side not in points for side in cameras):
+                    raise ValueError("Kalibrér alle tilsluttede kameraer først.")
+                new_mappings = [transform(points[side], radius) for side in cameras]
                 frames = capture_pair()
                 mappings = new_mappings
                 empty_board = reference = frames
