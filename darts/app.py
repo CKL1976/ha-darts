@@ -16,7 +16,7 @@ from scipy.optimize import least_squares
 
 
 from camera import SnapshotCamera
-from deepdarts import DeepDarts, MAX_MODEL_BYTES, download_d1
+from deepdarts import DeepDarts, download_d1
 from imaging import (decode_image, encode_image, fit_homography, grayscale,
                      hsv_image, project_points, sample_image, valid_quad)
 from mqtt_entities import DartEntities
@@ -227,7 +227,7 @@ def change_mask(previous, current):
 def detect_throw(before, after, mappings):
     model = deepdarts_model
     if model is None:
-        raise ValueError("Upload en DeepDarts-model for at registrere kast.")
+        raise ValueError("Installér DeepDarts D1 for at registrere kast.")
     views = []
     for previous, frame, mapping in zip(before, after, mappings):
         mask = change_mask(previous, frame)
@@ -245,18 +245,6 @@ def detect_throw(before, after, mappings):
         counts = "/".join(str(len(view)) for view in views)
         raise ValueError(f"DeepDarts fandt intet fælles træf. Kandidater pr. kamera: {counts}.")
     return hit
-
-
-@app.post("/deepdarts/model")
-def install_deepdarts():
-    request.max_content_length = MAX_MODEL_BYTES + 64 * 1024
-    upload = request.files.get("model")
-    if upload is None:
-        return {"error": "Vælg en TFLite-modelfil."}, 400
-    weights = upload.stream.read(MAX_MODEL_BYTES + 1)
-    if len(weights) > MAX_MODEL_BYTES or weights[4:8] != b"TFL3":
-        return {"error": "Vælg en gyldig TFLite-fil på højst 64 MB."}, 400
-    return activate_model(weights)
 
 
 @app.post("/deepdarts/download")
@@ -381,7 +369,7 @@ def turn_state():
                 for dart in darts
             ]
     return {"camera_hits": views, "darts": list(darts), "total": sum(d["points"] for d in darts),
-            "status": ("Upload en DeepDarts-model for at registrere kast."
+            "status": ("Installér DeepDarts D1 for at registrere kast."
                        if deepdarts_model is None and reference is not None else status),
             "mqtt": entities.connection_status if entities else "Angiv mqtt_host i Konfiguration"}
 

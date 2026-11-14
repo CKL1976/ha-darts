@@ -75,9 +75,6 @@ på den ældre kalibrering med fire eller ni punkter.
 ## DeepDarts
 
 Åbn **DeepDarts** i appen og vælg **Hent og installér DeepDarts D1**.
-Du kan også uploade en float32 TFLite-model med
-800 × 800 RGB-input og to YOLO-udgange. Appen understøtter det
-[TFLite-format, Dart-Vision beskriver](https://github.com/iambhabha/Dart-Vision#input--output-specification).
 Se [DeepDarts-artiklen](https://arxiv.org/abs/2105.09880)
 og [forskernes kode og modelhenvisninger](https://github.com/wmcnally/deep-darts).
 

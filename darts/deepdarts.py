@@ -4,7 +4,6 @@ from urllib.request import urlopen
 
 import numpy as np
 from PIL import Image
-from scipy.special import expit
 
 MAX_MODEL_BYTES = 64 * 1024 * 1024
 
@@ -50,15 +49,15 @@ class DeepDarts:
 def decode_tips(heads, width, height):
     predictions = []
     for head in heads:
-        size = head.shape[1]
-        cells = head.reshape(size, size, 3, 10)
-        scores = expit(cells[..., 4]) * expit(cells[..., 5])
-        dart = cells[..., 5] >= np.max(cells[..., 6:], axis=-1)
-        rows, columns, anchors = np.where(dart & (scores >= .25))
-        offsets = expit(cells[rows, columns, anchors, :2])
-        for row, column, anchor, (dx, dy) in zip(rows, columns, anchors, offsets):
-            point = np.array([(column + dx) / size, (row + dy) / size], dtype=np.float32)
-            predictions.append((float(scores[row, column, anchor]), point))
+        cells = head.reshape(-1, 10)
+        # The verified D1 export already returns normalized box centers
+        # and probabilities. Applying sigmoid or grid offsets again corrupts both.
+        scores = cells[:, 4] * cells[:, 5]
+        dart = np.argmax(cells[:, 5:], axis=1) == 0
+        valid = np.all((cells[:, :2] >= 0) & (cells[:, :2] < 1), axis=1)
+        for score, point in zip(scores[dart & valid & (scores >= .25)],
+                                cells[dart & valid & (scores >= .25), :2]):
+            predictions.append((float(score), point))
     accepted = []
     for _, point in sorted(predictions, key=lambda prediction: prediction[0], reverse=True):
         if all(np.linalg.norm(point - earlier) > .0125 for earlier in accepted):
