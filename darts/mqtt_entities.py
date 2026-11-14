@@ -66,6 +66,7 @@ class DartEntities:
             "unique_id": f"{BASE}_{SENSOR}",
             "default_entity_id": f"sensor.{BASE}_{SENSOR}",
             "state_topic": STATE_TOPIC,
+            "value_template": "{{ value | int }}",
             "device": {"identifiers": [BASE], "name": "HA Darts"},
         }))
         if self.last_score is not None:
