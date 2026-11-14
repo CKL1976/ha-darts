@@ -21,6 +21,22 @@ Start appen og åbn webgrænsefladen.
    sidst godkendte score bevares.
 4. Fjern alle pile inden næste tur.
 
-Detektion er foreløbig knapstyret. Appen viser scoren i sin egen
-Home Assistant-visning. MQTT-sensorer og automatisk kastudløsning er endnu
-ikke implementeret.
+## MQTT-entiteter
+
+Angiv brokerens adresse i `mqtt_host` samt port og eventuelt login under
+appens Konfiguration. MQTT-integrationen i Home Assistant skal være på den
+samme broker og bruge samme discovery-prefix. Lad `mqtt_host` stå tom for
+at køre appen uden MQTT.
+
+Appen registrerer tre sensorer og to billedentiteter under enheden HA Darts:
+
+- `sensor.ha_darts_seneste_kast`
+- `sensor.ha_darts_antal_pile`
+- `sensor.ha_darts_tur_score`
+- `image.ha_darts_venstre`
+- `image.ha_darts_hoejre`
+
+Scoren opdateres ved godkendte kast og nulstilling. Billeder sendes ved
+billedhentning, turstart og godkendte kast. Brokeren gemmer de seneste
+billeder på de to MQTT-emner, så de kan vises efter genstart af Home Assistant.
+Detektion er knapstyret.

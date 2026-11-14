@@ -10,6 +10,8 @@ import numpy as np
 from flask import Flask, Response, abort, render_template, request
 from waitress import serve
 
+from mqtt_entities import DartEntities
+
 app = Flask(__name__)
 lock = Lock()
 options_path = Path("/data/options.json")
@@ -18,6 +20,7 @@ sides = ("left", "right")
 sectors = (20, 1, 18, 4, 13, 6, 10, 15, 2, 17, 3, 19, 7, 16, 8, 11, 14, 9, 12, 5)
 reference = None
 darts = []
+entities = None
 
 
 @app.before_request
@@ -115,6 +118,13 @@ def index():
     return render_template("index.html")
 
 
+def encode_image(frame):
+    success, jpeg = cv2.imencode(".jpg", frame)
+    if not success:
+        raise ValueError("Kunne ikke kode kamerabilledet.")
+    return jpeg.tobytes()
+
+
 @app.get("/image/<side>")
 def image(side):
     if side not in sides:
@@ -122,8 +132,10 @@ def image(side):
     try:
         with lock:
             frame = capture(side)
-        _, jpeg = cv2.imencode(".jpg", frame)
-        return Response(jpeg.tobytes(), mimetype="image/jpeg",
+            jpeg = encode_image(frame)
+            if entities:
+                entities.update_image(side, jpeg)
+        return Response(jpeg, mimetype="image/jpeg",
                         headers={"Cache-Control": "no-store"})
     except (OSError, ValueError, cv2.error) as exc:
         return str(exc), 502
@@ -133,6 +145,7 @@ def image(side):
 def act(action):
     global reference
     with lock:
+        frames = None
         try:
             if action == "calibrate":
                 data = request.get_json()
@@ -145,7 +158,8 @@ def act(action):
                 reference = None
                 darts.clear()
             elif action == "reset":
-                reference = capture_pair()
+                frames = capture_pair()
+                reference = frames
                 darts.clear()
             elif action == "dart":
                 if reference is None or not calibration_path.exists():
@@ -160,8 +174,19 @@ def act(action):
                 abort(404)
         except (OSError, ValueError, KeyError, TypeError, cv2.error, np.linalg.LinAlgError) as exc:
             return {"error": str(exc)}, 400
+        if entities:
+            entities.update_turn(darts)
+            if frames is not None:
+                for side, frame in zip(sides, frames):
+                    try:
+                        entities.update_image(side, encode_image(frame))
+                    except (ValueError, cv2.error):
+                        app.logger.warning("Kunne ikke publicere kamerabillede fra %s", side)
         return {"darts": list(darts), "total": sum(d["points"] for d in darts)}
 
 
 if __name__ == "__main__":
+    options = json.loads(options_path.read_text())
+    if options.get("mqtt_host"):
+        entities = DartEntities(options)
     serve(app, host="0.0.0.0", port=8099, threads=4)
