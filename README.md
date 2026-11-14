@@ -39,3 +39,9 @@ seneste billede til visning og detektion. Et almindeligt JPEG-endpoint
 hentes løbende. Hvis kameraets MJPEG-feed bruger en anden sti end /picture,
 angiv den i `left_live_url` og `right_live_url`. Kalibrering fryser billederne,
 så krydsene kan markeres på samme billedpar.
+
+## Farve ved wirekryds
+
+Ved et træf tæt på en wire kan appen bruge farven i billedet af den tomme
+skive til at vælge mellem nærliggende felter. Begge kameraer skal vise
+samme tydelige farve, og feltet skal være entydigt blandt kandidaterne.

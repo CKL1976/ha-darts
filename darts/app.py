@@ -113,7 +113,46 @@ def axes(mask, transform):
     return result
 
 
-def detect(masks, transforms, diagnostics=None):
+def expected_color(field):
+    if field == "DB":
+        return "red"
+    if field == "SB":
+        return "green"
+    if field.startswith("S"):
+        return "neutral"
+    if field.startswith(("D", "T")):
+        return "red" if sectors.index(int(field[1:])) % 2 == 0 else "green"
+    return None
+
+
+def surface_color(frame, x, y):
+    if not (4 <= x < frame.shape[1] - 4 and 4 <= y < frame.shape[0] - 4):
+        return None
+    patch = frame[y-4:y+5, x-4:x+5]
+    hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+    hue, saturation, value = hsv.transpose(2, 0, 1)
+    saturated = (saturation >= 90) & (value >= 45)
+    votes = {
+        "red": saturated & ((hue <= 12) | (hue >= 168)),
+        "green": saturated & (hue >= 36) & (hue <= 95),
+        "neutral": (saturation <= 50) | (value < 35),
+    }
+    return next((color for color, pixels in votes.items() if pixels.mean() >= .80), None)
+
+
+def resolve_by_color(fields, hit, before, inverses):
+    colors = []
+    for frame, inverse in zip(before, inverses):
+        point = cv2.perspectiveTransform(hit.reshape(1, 1, 2), inverse)[0, 0]
+        x, y = np.rint(point).astype(int)
+        colors.append(surface_color(frame, x, y))
+    if colors[0] is None or colors[0] != colors[1] or "MISS" in fields:
+        return None
+    matches = [field for field in fields if expected_color(field) == colors[0]]
+    return matches[0] if len(matches) == 1 else None
+
+
+def detect(masks, transforms, diagnostics=None, before=None):
     left_axes, right_axes = [axes(mask, transform)
                             for mask, transform in zip(masks, transforms)]
     if diagnostics is not None:
@@ -160,20 +199,28 @@ def detect(masks, transforms, diagnostics=None):
     alternatives = list(dict.fromkeys(
         item[2] for item in ranked[1:] if item[2] != field and item[0] >= weight * .78
     ))
-    near_wire = any(field_at(*(hit + offset))[0] != field
-                    for offset in ((2, 0), (-2, 0), (0, 2), (0, -2)))
+    nearby = dict(field_at(*(hit + offset))
+                  for offset in ((2, 0), (-2, 0), (0, 2), (0, -2)))
+    near_wire = any(candidate != field for candidate in nearby)
     reasons = []
     if alternatives:
         reasons.append("competing_fields")
     if near_wire:
         reasons.append("near_wire")
+    # Use color only for local wire ambiguity. A distant competing impact
+    # still needs geometric evidence from both views.
+    if near_wire and before is not None and all(other in nearby for other in alternatives):
+        nearby[field] = points
+        resolved = resolve_by_color(nearby, hit, before, inverses)
+        if resolved is not None:
+            return {**best, "field": resolved, "points": nearby[resolved]}
     if diagnostics is not None:
         diagnostics.update(best=best, alternatives=alternatives,
                            reason=", ".join(reasons) if reasons else "accepted")
     return None if reasons else best
 
 
-def detect_throw(before, after, mappings):
+def detect_throw(before, after, mappings, board):
     masks = []
     for previous, current in zip(before, after):
         if previous.shape != current.shape:
@@ -182,7 +229,7 @@ def detect_throw(before, after, mappings):
         masks.append(cv2.threshold(delta, 30, 255, cv2.THRESH_BINARY)[1])
 
     diagnostics = {}
-    hit = detect(masks, mappings, diagnostics)
+    hit = detect(masks, mappings, diagnostics, before=board)
     if hit is not None:
         return hit
 
@@ -253,7 +300,7 @@ def analyze_frames(frames):
     if len(darts) >= 3:
         status = "Tur slut. Fjern pilene."
         return
-    hit = detect_throw(reference, frames, mappings)
+    hit = detect_throw(reference, frames, mappings, empty_board)
     previous = pending
     pending = hit
     if previous is None or previous["field"] != hit["field"] or math.hypot(
