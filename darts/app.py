@@ -1,3 +1,4 @@
+import base64
 import json
 import math
 from concurrent.futures import ThreadPoolExecutor
@@ -159,14 +160,6 @@ def colors_at(hit, before, inverses):
     return colors
 
 
-def resolve_by_color(fields, hit, before, inverses):
-    colors = colors_at(hit, before, inverses)
-    if colors[0] is None or colors[0] != colors[1] or "MISS" in fields:
-        return None
-    matches = [field for field in fields if expected_color(field) == colors[0]]
-    return matches[0] if len(matches) == 1 else None
-
-
 def detect(masks, transforms, diagnostics=None, before=None):
     left_axes, right_axes = [axes(mask, transform)
                             for mask, transform in zip(masks, transforms)]
@@ -207,38 +200,15 @@ def detect(masks, transforms, diagnostics=None, before=None):
                                      if not left_axes or not right_axes
                                      else "no_supported_intersection")
         return None
-    ranked = sorted(candidates.values(), key=lambda item: item[0], reverse=True)
-    weight, hit, field, points = ranked[0]
-    best = {"field": field, "points": points,
+    def rank(candidate):
+        weight, hit, field, _ = candidate
+        colors = colors_at(hit, before, inverses) if before is not None else []
+        matches = sum(color == expected_color(field) for color in colors)
+        return weight * (1 + .10 * matches)
+
+    _, hit, field, points = max(candidates.values(), key=rank)
+    return {"field": field, "points": points,
             "x_mm": round(float(hit[0]), 1), "y_mm": round(float(hit[1]), 1)}
-    alternatives = list(dict.fromkeys(
-        item[2] for item in ranked[1:] if item[2] != field and item[0] >= weight * .78
-    ))
-    nearby = dict(field_at(*(hit + offset))
-                  for offset in ((2, 0), (-2, 0), (0, 2), (0, -2)))
-    near_wire = any(candidate != field for candidate in nearby)
-    reasons = []
-    if alternatives:
-        reasons.append("competing_fields")
-    if near_wire:
-        reasons.append("near_wire")
-    # Use color only for local wire ambiguity. A distant competing impact
-    # still needs geometric evidence from both views.
-    if not reasons and before is not None:
-        colors = colors_at(hit, before, inverses)
-        if colors[0] == colors[1] and colors[0] in ("red", "green") and (
-            colors[0] != expected_color(field)
-        ):
-            reasons.append("color_mismatch")
-    if near_wire and before is not None and all(other in nearby for other in alternatives):
-        nearby[field] = points
-        resolved = resolve_by_color(nearby, hit, before, inverses)
-        if resolved is not None:
-            return {**best, "field": resolved, "points": nearby[resolved]}
-    if diagnostics is not None:
-        diagnostics.update(best=best, alternatives=alternatives,
-                           reason=", ".join(reasons) if reasons else "accepted")
-    return None if reasons else best
 
 
 def detect_throw(before, after, mappings, board):
@@ -253,17 +223,6 @@ def detect_throw(before, after, mappings, board):
     hit = detect(masks, mappings, diagnostics, before=board)
     if hit is not None:
         return hit
-
-    reason = diagnostics["reason"]
-    if "best" in diagnostics:
-        message = f"Usikkert kast. Bedste bud: {diagnostics['best']['field']}."
-        if diagnostics["alternatives"]:
-            message += " Andre mulige felter: " + ", ".join(diagnostics["alternatives"]) + "."
-        if "color_mismatch" in reason:
-            message += " Begge kameraer viser en farve, der afviger fra skivekortet."
-        if "near_wire" in reason:
-            message += " Træfpunktet ligger tæt på en wire."
-        raise ValueError(message)
 
     left, right = diagnostics["line_counts"]
     raise ValueError(
@@ -366,6 +325,71 @@ def watch_board():
 def state():
     with lock:
         return turn_state(), 200, {"Cache-Control": "no-store"}
+
+
+def refine_calibration(frame, initial):
+    # In the initial board plane, find the colored side of each ring edge.
+    offset = np.float32([[1, 0, 190], [0, 1, 190], [0, 0, 1]])
+    rectified = cv2.warpPerspective(frame, offset @ initial, (381, 381))
+    hsv = cv2.cvtColor(rectified, cv2.COLOR_BGR2HSV)
+    chroma = cv2.GaussianBlur(hsv[:, :, 1].astype(np.float32), (3, 3), 0)
+    indices = np.arange(.5, len(sectors), .5)
+    offsets = np.arange(-6, 7)
+    image_to_raw = np.linalg.inv(offset @ initial)
+    observed, targets = [], []
+    for radius, sign in ((double_inner, 1), (double_outer, -1),
+                         (treble_inner, 1), (treble_outer, -1)):
+        directions = board_points(indices, 1)
+        samples = directions[:, None, :] * (radius + offsets[None, :, None]) + 190
+        xy = np.rint(samples).astype(int)
+        signal = chroma[xy[:, :, 1], xy[:, :, 0]]
+        gradient = np.diff(signal, axis=1) * sign
+        peaks = gradient.argmax(axis=1)
+        good = gradient.max(axis=1) >= 24
+        if good.sum() < 12:
+            raise ValueError("Ringkanten er for utydelig til automatisk justering.")
+        found = directions[good] * (radius + offsets[peaks[good]] + .5)[:, None] + 190
+        observed.extend(cv2.perspectiveTransform(found.astype(np.float32)[None], image_to_raw)[0])
+        targets.extend(directions[good] * radius)
+
+    observed = np.float32(observed)
+    targets = np.float32(targets)
+    fitted, inliers = cv2.findHomography(observed, targets, cv2.RANSAC, 2.0)
+    if fitted is None or inliers.mean() < .5:
+        raise ValueError("Ringkanterne stemmer ikke nok overens. Prøv manuel kalibrering.")
+    selected = inliers.ravel().astype(bool)
+    def error(mapping):
+        predicted = cv2.perspectiveTransform(observed[selected][None], mapping)[0]
+        return np.median(np.linalg.norm(predicted - targets[selected], axis=1))
+    return fitted if error(fitted) < error(initial) else initial
+
+
+@app.post("/auto-calibrate")
+def auto_calibrate():
+    try:
+        with lock:
+            frames = capture_pair()
+            saved = json.loads(calibration_path.read_text()) if calibration_path.exists() else None
+        if saved is None:
+            raise ValueError("Gem først en manuel kalibrering, så appen kender skivens retning.")
+        radius = double_inner if saved and saved.get("ring") == "inner_double" else double_outer
+        proposal, images = {}, {}
+        for side, frame in zip(sides, frames):
+            initial = transform(saved[side], radius)
+            fitted = refine_calibration(frame, initial)
+            anchors = np.vstack((
+                board_points([sectors.index(n) for n in anchor_sectors], double_inner, -sector_angle / 2),
+                board_points([sectors.index(n) for n in anchor_sectors], treble_outer, -sector_angle / 2),
+                [[0, 0]],
+            )).astype(np.float32)
+            proposal[side] = cv2.perspectiveTransform(anchors[None], np.linalg.inv(fitted))[0].tolist()
+            ok, jpeg = cv2.imencode(".jpg", frame)
+            if not ok:
+                raise ValueError("Kunne ikke vise kalibreringsbilledet.")
+            images[side] = base64.b64encode(jpeg.tobytes()).decode("ascii")
+        return {"points": proposal, "images": images}
+    except (OSError, ValueError, KeyError, TypeError, cv2.error, np.linalg.LinAlgError) as exc:
+        return {"error": str(exc)}, 400
 
 
 @app.post("/calibration-preview")

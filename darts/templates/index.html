@@ -20,6 +20,7 @@ canvas{display:block;width:100%;height:auto;cursor:crosshair;margin-bottom:14px}
 <p><strong id="score">0 point</strong> <span id="throws"></span></p>
 <div>
 <button id="reset">Start tur med tom skive</button>
+<button id="autoCalibrate">Auto-kalibrér tom skive</button>
 <button id="calibrate">Kalibrér</button>
 <button id="refresh">Hent billeder</button>
 </div>
@@ -68,6 +69,7 @@ function controls() {
   get("redoPoint").disabled = busy;
   get("refresh").disabled = busy || !!points;
   get("calibrate").disabled = busy;
+  get("autoCalibrate").disabled = busy || !!points;
   get("calibrate").textContent = points ? "Afbryd kalibrering" : "Kalibrér";
 }
 async function refresh() {
@@ -123,6 +125,19 @@ function prompt() {
 }
 get("reset").onclick = () => run(() => action("reset"));
 get("refresh").onclick = () => run(refresh);
+get("autoCalibrate").onclick = () => run(async () => {
+  const response = await fetch("auto-calibrate", {method: "POST"});
+  const data = await response.json();
+  if (!response.ok) throw Error(data.error);
+  await Promise.all(sides.map(side => new Promise((resolve, reject) => {
+    const image = get(side);
+    image.onload = resolve;
+    image.onerror = () => reject(Error("Kunne ikke vise kalibreringsbilledet."));
+    image.src = "data:image/jpeg;base64," + data.images[side];
+  })));
+  points = data.points;
+  await previewCalibration(true);
+});
 get("calibrate").onclick = () => run(async () => {
   points = points ? null : {left:[], right:[]};
   editing = null;
@@ -198,7 +213,7 @@ function hideOverlay() {
   overlayReady = false;
   for (const side of sides) get(side + "Overlay").hidden = true;
 }
-async function previewCalibration() {
+async function previewCalibration(automatic = false) {
   const response = await fetch("calibration-preview", {
     method: "POST", headers: {"Content-Type": "application/json"},
     body: JSON.stringify(points)
@@ -235,6 +250,7 @@ async function previewCalibration() {
   const worst = side => Math.max(...data.errors[side]).toFixed(1);
   get("status").textContent = "Sammenlign de blå wirer og tal med skiven. Største afvigelse: venstre " +
     worst("left") + " px, højre " + worst("right") + " px.";
+  if (automatic) get("status").textContent = "Automatisk forslag. Kontrollér de blå wirer og tal, før du gemmer.";
   const combined = labels.map((_, index) => Math.max(...sides.map(side => data.errors[side][index])));
   get("editPoint").selectedIndex = combined.indexOf(Math.max(...combined));
 }

@@ -53,3 +53,11 @@ Eclipse Pro 2. Før du gemmer, vises de 20 tal og wirerne på begge billeder.
 Kontrollér især 20 øverst, 6 til højre, 3 nederst og 11 til venstre på den
 fysiske skive. Ved tydelig farveuoverensstemmelse i begge kameraer markeres
 kastet som usikkert.
+
+## Automatisk finjustering
+
+Tøm skiven og vælg Auto-kalibrér tom skive. En gemt manuel kalibrering
+giver startposition og retning. Kontrollér forslaget i begge billeder,
+og gem, hvis overlejringen passer. Kastdetektionen scorer den bedst
+rangerede kandidat, når den bekræftes i to aflæsninger. MQTT-status viser
+brokerens kvittering for pointværdien.
