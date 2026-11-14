@@ -328,40 +328,48 @@ def state():
 
 
 def refine_calibration(frame, initial):
-    # In the initial board plane, find the colored side of each ring edge.
-    offset = np.float32([[1, 0, 190], [0, 1, 190], [0, 0, 1]])
-    rectified = cv2.warpPerspective(frame, offset @ initial, (381, 381))
-    hsv = cv2.cvtColor(rectified, cv2.COLOR_BGR2HSV)
-    chroma = cv2.GaussianBlur(hsv[:, :, 1].astype(np.float32), (3, 3), 0)
-    indices = np.arange(.5, len(sectors), .5)
-    offsets = np.arange(-6, 7)
-    image_to_raw = np.linalg.inv(offset @ initial)
+    # Sample in the original pixels at half-millimeter intervals.
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    hue, saturation, value = hsv.transpose(2, 0, 1)
+    colored = (((hue <= 12) | (hue >= 168) | ((hue >= 36) & (hue <= 95)))
+               & (value >= 45))
+    chroma = np.where(colored, saturation, 0).astype(np.float32)
+    indices = np.arange(0, len(sectors), .25)
+    directions = board_points(indices, 1)
+    offsets = np.arange(-6, 6.5, .5)
+    inverse = np.linalg.inv(initial)
     observed, targets = [], []
     for radius, sign in ((double_inner, 1), (double_outer, -1),
                          (treble_inner, 1), (treble_outer, -1)):
-        directions = board_points(indices, 1)
-        samples = directions[:, None, :] * (radius + offsets[None, :, None]) + 190
-        xy = np.rint(samples).astype(int)
-        signal = chroma[xy[:, :, 1], xy[:, :, 0]]
-        gradient = np.diff(signal, axis=1) * sign
-        peaks = gradient.argmax(axis=1)
-        good = gradient.max(axis=1) >= 24
-        if good.sum() < 12:
-            raise ValueError("Ringkanten er for utydelig til automatisk justering.")
-        found = directions[good] * (radius + offsets[peaks[good]] + .5)[:, None] + 190
-        observed.extend(cv2.perspectiveTransform(found.astype(np.float32)[None], image_to_raw)[0])
+        polar = directions[:, None, :] * (radius + offsets[None, :, None])
+        xy = cv2.perspectiveTransform(polar.astype(np.float32).reshape(1, -1, 2),
+                                      inverse).reshape(polar.shape)
+        signal = cv2.remap(chroma, xy[:, :, 0].copy(), xy[:, :, 1].copy(),
+                           cv2.INTER_LINEAR)
+        # Compare averaged samples on each side of the expected transition.
+        gradient = (signal[:, 4:] + signal[:, 3:-1]
+                    - signal[:, 1:-3] - signal[:, :-4]) * (.5 * sign)
+        peaks = (gradient - 2 * np.abs(offsets[2:-2])).argmax(axis=1)
+        good = gradient[np.arange(len(peaks)), peaks] >= 28
+        if any(group.sum() < 3 for group in np.array_split(good, 4)):
+            raise ValueError("Ringkanten er for utydelig i en del af billedet.")
+        found = directions[good] * (radius + offsets[peaks[good] + 2])[:, None]
+        raw = cv2.perspectiveTransform(found.astype(np.float32)[None], inverse)[0]
+        observed.extend(raw)
         targets.extend(directions[good] * radius)
 
     observed = np.float32(observed)
     targets = np.float32(targets)
-    fitted, inliers = cv2.findHomography(observed, targets, cv2.RANSAC, 2.0)
-    if fitted is None or inliers.mean() < .5:
+    fitted, inliers = cv2.findHomography(observed, targets, cv2.RANSAC, 1.5)
+    if fitted is None or inliers.mean() < .55:
         raise ValueError("Ringkanterne stemmer ikke nok overens. Prøv manuel kalibrering.")
-    selected = inliers.ravel().astype(bool)
+
     def error(mapping):
-        predicted = cv2.perspectiveTransform(observed[selected][None], mapping)[0]
-        return np.median(np.linalg.norm(predicted - targets[selected], axis=1))
-    return fitted if error(fitted) < error(initial) else initial
+        predicted = cv2.perspectiveTransform(observed[None], mapping)[0]
+        # Evaluate both fits against the same samples from every ring and quadrant.
+        return np.mean(np.minimum(np.linalg.norm(predicted - targets, axis=1), 4))
+
+    return fitted if error(fitted) + .1 < error(initial) else initial
 
 
 @app.post("/auto-calibrate")
@@ -376,7 +384,11 @@ def auto_calibrate():
         proposal, images = {}, {}
         for side, frame in zip(sides, frames):
             initial = transform(saved[side], radius)
-            fitted = refine_calibration(frame, initial)
+            try:
+                fitted = refine_calibration(frame, initial)
+            except ValueError as exc:
+                name = "Venstre kamera" if side == "left" else "Højre kamera"
+                raise ValueError(f"{name}: {exc}") from exc
             anchors = np.vstack((
                 board_points([sectors.index(n) for n in anchor_sectors], double_inner, -sector_angle / 2),
                 board_points([sectors.index(n) for n in anchor_sectors], treble_outer, -sector_angle / 2),
