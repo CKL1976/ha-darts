@@ -25,20 +25,31 @@ class DartEntities:
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
         if options.get("mqtt_username"):
             self.client.username_pw_set(options["mqtt_username"], options.get("mqtt_password"))
+        self.connection_status = "Forbinder"
         self.client.on_connect = self.on_connect
+        self.client.on_connect_fail = self.on_connect_fail
+        self.client.on_disconnect = self.on_disconnect
         self.client.enable_logger(LOGGER)
         self.client.connect_async(options["mqtt_host"], options.get("mqtt_port", 1883))
         self.client.loop_start()
 
+    def on_connect_fail(self, client, userdata):
+        self.connection_status = "Forbindelse mislykkedes – prøver igen"
+        LOGGER.warning("MQTT: broker connection failed")
+
+    def on_disconnect(self, client, userdata, flags, reason_code, properties):
+        self.connection_status = "Afbrudt"
+
     def on_connect(self, client, userdata, flags, reason_code, properties):
         if reason_code.is_failure:
+            self.connection_status = f"Afvist: {reason_code}"
             LOGGER.warning("MQTT connection rejected: %s", reason_code)
             return
         with self.lock:
-            for key, (name, field) in SENSORS.items():
+            self.connection_status = "Forbundet"
+            for key, (name, _) in SENSORS.items():
                 self.discover("sensor", key, name, {
-                    "state_topic": f"{BASE}/turn",
-                    "value_template": "{{ value_json." + field + " }}",
+                    "state_topic": f"{BASE}/sensor/{key}",
                 })
             for side, (key, name) in IMAGES.items():
                 self.discover("image", key, name, {"image_topic": f"{BASE}/image/{side}"})
@@ -56,6 +67,11 @@ class DartEntities:
 
     def publish_turn(self):
         self.client.publish(f"{BASE}/turn", json.dumps(self.state), qos=1, retain=True)
+        for key, (_, field) in SENSORS.items():
+            result = self.client.publish(f"{BASE}/sensor/{key}", str(self.state[field]),
+                                         qos=1, retain=True)
+            if result.rc != mqtt.MQTT_ERR_SUCCESS:
+                LOGGER.warning("MQTT: failed to queue %s (code %s)", key, result.rc)
 
     def publish_image(self, side, jpeg):
         self.client.publish(f"{BASE}/image/{side}", jpeg, qos=1, retain=True)

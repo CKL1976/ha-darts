@@ -13,6 +13,8 @@ button:disabled{opacity:.5}output{display:block;min-height:2rem}strong{font-size
 dialog{max-width:min(480px,90vw);border:1px solid #5ea984;border-radius:8px;background:#182522;color:inherit}
 dialog::backdrop{background:#0009}
 canvas{display:block;width:100%;height:auto;cursor:crosshair;margin-bottom:14px}
+.camera-frame{position:relative}
+.camera-frame canvas{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;margin:0}
 </style>
 <h1>HA Darts</h1>
 <p><strong id="score">0 point</strong> <span id="throws"></span></p>
@@ -21,10 +23,15 @@ canvas{display:block;width:100%;height:auto;cursor:crosshair;margin-bottom:14px}
 <button id="calibrate">Kalibrér</button>
 <button id="refresh">Hent billeder</button>
 </div>
+<p>MQTT: <span id="mqtt">Henter status</span></p>
+<div id="review" hidden>
+<button id="saveCalibration">Gem kalibrering</button>
+<button id="redoPoint">Ret sidste kryds</button>
+</div>
 <output id="status" aria-live="polite"></output>
 <div class="views">
-<figure><figcaption>Venstre kamera</figcaption><img id="left" alt="Venstre kamerabillede"></figure>
-<figure><figcaption>Højre kamera</figcaption><img id="right" alt="Højre kamerabillede"></figure>
+<figure><figcaption>Venstre kamera</figcaption><div class="camera-frame"><img id="left" alt="Venstre kamerabillede"><canvas id="leftOverlay" hidden></canvas></div></figure>
+<figure><figcaption>Højre kamera</figcaption><div class="camera-frame"><img id="right" alt="Højre kamerabillede"><canvas id="rightOverlay" hidden></canvas></div></figure>
 </div>
 <dialog id="zoom">
 <h2 id="zoomTitle"></h2>
@@ -39,12 +46,17 @@ const sides = ["left", "right"];
 const wires = ["5/20", "13/6", "17/3", "8/11"];
 let points = null, busy = false, lastTurn = null;
 let zoom = null;
+let overlayReady = false;
 const cropSize = 180;
 const canvas = get("crop");
 const context = canvas.getContext("2d");
 function controls() {
   get("reset").disabled = busy || !!points;
-  get("refresh").disabled = busy;
+  const reviewing = points?.left.length === 4 && points?.right.length === 4;
+  get("review").hidden = !reviewing;
+  get("saveCalibration").disabled = busy || !overlayReady;
+  get("redoPoint").disabled = busy;
+  get("refresh").disabled = busy || !!points;
   get("calibrate").disabled = busy;
   get("calibrate").textContent = points ? "Afbryd kalibrering" : "Kalibrér";
 }
@@ -75,6 +87,7 @@ function drawTurn(data) {
   get("score").textContent = data.total + " point";
   get("throws").textContent = data.darts.map(d => d.field).join(" · ");
   get("status").textContent = data.status;
+  get("mqtt").textContent = data.mqtt;
 }
 async function poll() {
   try {
@@ -108,6 +121,7 @@ get("reset").onclick = () => run(() => action("reset"));
 get("refresh").onclick = () => run(refresh);
 get("calibrate").onclick = () => run(async () => {
   points = points ? null : {left:[], right:[]};
+  hideOverlay();
   get("status").textContent = "";
   if (points) {
     await refresh();
@@ -115,7 +129,7 @@ get("calibrate").onclick = () => run(async () => {
   }
 });
 for (const side of sides) get(side).onclick = event => {
-  if (!points || busy) return;
+  if (!points || busy || points[side].length === 4) return;
   const other = side === "left" ? "right" : "left";
   if (points[side].length > points[other].length) return;
   const img = event.currentTarget;
@@ -164,12 +178,51 @@ get("confirm").onclick = () => {
   points[side].push([x + selected[0] * size, y + selected[1] * size]);
   get("zoom").close();
   if (points.left.length === 4 && points.right.length === 4) {
-    const payload = points;
-    points = null;
-    run(() => action("calibrate", payload));
+    run(previewCalibration);
   } else if (points.left.length === points.right.length) prompt();
   else get("status").textContent = "Vælg og bekræft samme punkt i det andet billede.";
 };
+function hideOverlay() {
+  overlayReady = false;
+  for (const side of sides) get(side + "Overlay").hidden = true;
+}
+async function previewCalibration() {
+  const response = await fetch("calibration-preview", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(points)
+  });
+  const data = await response.json();
+  if (!response.ok) throw Error(data.error);
+  for (const side of sides) {
+    const img = get(side);
+    const layer = get(side + "Overlay");
+    layer.width = img.naturalWidth;
+    layer.height = img.naturalHeight;
+    const pen = layer.getContext("2d");
+    pen.strokeStyle = "#50e6ff";
+    pen.lineWidth = 3;
+    for (const line of data[side]) {
+      pen.beginPath();
+      pen.moveTo(...line[0]);
+      for (const point of line.slice(1)) pen.lineTo(...point);
+      pen.stroke();
+    }
+    layer.hidden = false;
+  }
+  overlayReady = true;
+  get("status").textContent = "Kontrollér, om de blå linjer følger wirerne på begge billeder.";
+}
+get("redoPoint").onclick = () => {
+  hideOverlay();
+  for (const side of sides) points[side].pop();
+  prompt();
+  controls();
+};
+get("saveCalibration").onclick = () => run(async () => {
+  await action("calibrate", points);
+  points = null;
+  hideOverlay();
+});
 run(refresh).then(poll);
 </script>
 </html>

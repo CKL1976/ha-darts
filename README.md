@@ -13,7 +13,8 @@ Start appen og åbn webgrænsefladen.
 
 1. Tøm skiven, og vælg Kalibrér. Vælg krydset på dobbeltringens
    **inderste** wire ved 5/20, 13/6, 17/3 og 8/11. Sæt X i zoomvinduet
-   dér, hvor rød/grøn møder sort/hvid. Bekræft krydset for begge kameraer.
+   dér, hvor rød/grøn møder sort/hvid. Bekræft krydset for begge kameraer. Kontrollér derefter de beregnede
+   wirer på begge billeder, og vælg Gem kalibrering.
 2. Vælg Start tur med tom skive. Ældre kalibreringer bruger stadig den
    yderste wire, indtil du gennemfører en ny kalibrering.
 3. Kast én pil, og vent på scoren, før du kaster igen. Appen analyserer
@@ -26,7 +27,8 @@ Start appen og åbn webgrænsefladen.
 Angiv brokerens adresse i `mqtt_host` samt port og eventuelt login under
 appens Konfiguration. MQTT-integrationen i Home Assistant skal være på den
 samme broker og bruge samme discovery-prefix. Lad `mqtt_host` stå tom for
-at køre appen uden MQTT.
+at køre appen uden MQTT. Forbindelsesstatus vises i appens webvisning.
+Sensorernes rå værdier sendes på `ha_darts/sensor/+`.
 
 Appen registrerer tre sensorer og to billedentiteter under enheden HA Darts:
 

@@ -224,7 +224,8 @@ def image(side):
 
 def turn_state():
     return {"darts": list(darts), "total": sum(d["points"] for d in darts),
-            "status": status}
+            "status": status,
+            "mqtt": entities.connection_status if entities else "Angiv mqtt_host i Konfiguration"}
 
 
 def publish_turn(frames=None):
@@ -311,6 +312,29 @@ def watch_board():
 def state():
     with lock:
         return turn_state(), 200, {"Cache-Control": "no-store"}
+
+
+@app.post("/calibration-preview")
+def calibration_preview():
+    try:
+        data = request.get_json()
+        angles = np.linspace(0, 2 * np.pi, 181, dtype=np.float32)
+        circle = np.column_stack((np.sin(angles), -np.cos(angles)))
+        rings = [circle * radius for radius in (6.35, 15.9, 99, 107, 162, 170)]
+        spokes = []
+        for angle in np.deg2rad(np.arange(-9, 351, 18)):
+            direction = np.float32([np.sin(angle), -np.cos(angle)])
+            spokes.append(np.float32([direction * 15.9, direction * 170]))
+        overlay = {}
+        for side in sides:
+            inverse = np.linalg.inv(transform(data[side], radius=162))
+            overlay[side] = [
+                cv2.perspectiveTransform(line[None], inverse)[0].tolist()
+                for line in rings + spokes
+            ]
+        return overlay
+    except (KeyError, TypeError, ValueError, cv2.error, np.linalg.LinAlgError) as exc:
+        return {"error": str(exc)}, 400
 
 
 @app.post("/action/<action>")
