@@ -1,20 +1,17 @@
 # HA Darts
 
 Home Assistant OS-app, der finder den nye pil ud fra stillbilleder fra
-Home Assistant-kameraentiteter før og efter kastet.
+to HTTP-kameraer før og efter kastet.
 
 ## Installation
 
 Tilføj dette GitHub-repo under Indstillinger → Apps → App-butik → Repositories.
 Installér og start HA Darts, og åbn appens webgrænseflade.
 
-1. Tilføj dine kameraer med **Generic Camera** under Indstillinger → Enheder og
-   tjenester, hvis de ikke allerede findes som kameraentiteter. Brug kameraernes
-   `/picture`-adresse som stillbillede for venstre og højre.
-2. Åbn **Kameraer** i HA Darts, vælg en entitet til hver rolle, og tryk
-   **Gem kameraer**.
-3. Vælg **Kalibrér 9 punkter** med tom skive efter opgradering fra
-   URL-konfigurationen eller efter ændring af kameraroller.
+1. Åbn **Kameraer** i HA Darts, og indtast snapshotadressen for venstre
+   og højre kamera, fx `http://kamera.local/picture`.
+2. Tryk **Gem kameraer**. Appen tester begge adresser.
+3. Vælg **Kalibrér 9 punkter** med tom skive efter skift af kameraadresse.
 
 ## Første tur
 

@@ -24,13 +24,12 @@ canvas{display:block;width:100%;height:auto;cursor:crosshair;margin-bottom:14px}
 <details id="cameraSettings"{% if not configured %} open{% endif %}>
 <summary>Kameraer</summary>
 <form id="cameraForm">
-  <p>Vælg to kameraer fra Home Assistant.</p>
+  <p>Angiv kameraernes HTTP- eller HTTPS-adresse til et stillbillede.</p>
   <label for="camera-left">Venstre kamera</label>
-  <select id="camera-left" required></select>
+  <input id="camera-left" type="url" required value="{{ camera_urls.get('left', '') }}" placeholder="http://kamera.local/picture">
   <label for="camera-right">Højre kamera</label>
-  <select id="camera-right" required></select>
-  <button id="saveCameras" disabled>Gem kameraer</button>
-  <button type="button" id="reloadCameras">Opdatér liste</button>
+  <input id="camera-right" type="url" required value="{{ camera_urls.get('right', '') }}" placeholder="http://kamera.local/picture">
+  <button id="saveCameras">Gem kameraer</button>
   <output id="cameraStatus" aria-live="polite"></output>
 </form>
 </details>
@@ -115,44 +114,11 @@ function controls() {
   get("autoCalibrate").disabled = !configured || busy || !!points;
   get("calibrate").textContent = points ? "Afbryd kalibrering" : "Detaljeret kalibrering";
 }
-async function loadCameras() {
-  const button = get("saveCameras");
-  const output = get("cameraStatus");
-  button.disabled = true;
-  output.textContent = "Henter kameraer fra Home Assistant.";
-  try {
-    const response = await fetch("cameras", {cache: "no-store"});
-    const data = await response.json();
-    if (!response.ok) throw Error(data.error);
-    for (const side of sides) {
-      const select = get("camera-" + side);
-      select.replaceChildren(new Option("Vælg kamera", ""));
-      for (const camera of data.entities) {
-        const label = camera.name + " (" + camera.id + ")" + (camera.available ? "" : " · utilgængelig");
-        const option = new Option(label, camera.id);
-        option.disabled = !camera.available;
-        select.add(option);
-      }
-      select.value = data.selected[side] ?? "";
-      if (select.selectedIndex < 0) select.selectedIndex = 0;
-    }
-    const enough = data.entities.filter(camera => camera.available).length >= sides.length;
-    button.disabled = !enough;
-    output.textContent = enough ? "" : "Tilføj to tilgængelige kameraer i Home Assistant.";
-  } catch (err) {
-    output.textContent = err.message;
-  }
-}
-if (configured) {
-  get("cameraSettings").ontoggle = () => {
-    if (get("cameraSettings").open) loadCameras();
-  };
-}
-get("reloadCameras").onclick = loadCameras;
 get("cameraForm").onsubmit = async event => {
   event.preventDefault();
   const button = get("saveCameras");
   button.disabled = true;
+  get("cameraStatus").textContent = "Tester begge kameraer …";
   try {
     const selected = Object.fromEntries(sides.map(side => [side, get("camera-" + side).value]));
     const response = await fetch("cameras", {
@@ -598,6 +564,5 @@ get("saveCalibration").onclick = () => run(async () => {
 drawBoard([]);
 controls();
 if (configured) run(refresh).then(poll);
-else loadCameras();
 </script>
 </html>

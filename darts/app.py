@@ -16,7 +16,7 @@ from scipy.optimize import least_squares
 
 from diagnostics import diagnostics, capture_sample
 
-from camera import CAMERA_ID, EntityCamera, camera_entities
+from camera import SnapshotCamera
 from mqtt_entities import DartEntities
 
 app = Flask(__name__)
@@ -41,7 +41,7 @@ next_refinement = 0
 pending = None
 clear_frames = 0
 startup_frames = None
-status = "Vælg dine to Home Assistant-kameraer."
+status = "Indtast snapshotadresserne under Kameraer."
 darts = []
 entities = None
 cameras = {}
@@ -290,7 +290,8 @@ def detect_throw(before, after, mappings):
 
 
 def camera_selection():
-    return {role: camera.entity_id for role, camera in cameras.items()}
+    return {role: hashlib.sha256(camera.url.encode()).hexdigest()
+            for role, camera in cameras.items()}
 
 
 def require_cameras():
@@ -309,42 +310,44 @@ def saved_calibration():
     return saved
 
 
-@app.get("/cameras")
-def list_cameras():
-    try:
-        return {"entities": camera_entities(), "selected": camera_selection()}, 200, {"Cache-Control": "no-store"}
-    except (OSError, ValueError) as exc:
-        return {"error": str(exc)}, 502
-
-
 @app.post("/cameras")
 def select_cameras():
     global cameras, reference, empty_board, mappings, manual_mappings, pending, clear_frames, startup_frames, status
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
-        return {"error": "Vælg et kamera til hver rolle."}, 400
+        return {"error": "Angiv en snapshotadresse til hvert kamera."}, 400
     selected = {role: data.get(role) for role in camera_roles}
-    if any(not isinstance(value, str) or not CAMERA_ID.fullmatch(value) for value in selected.values()):
-        return {"error": "Vælg et kamera til hver rolle."}, 400
+    if any(not isinstance(value, str) or not value.strip() for value in selected.values()):
+        return {"error": "Angiv en snapshotadresse til hvert kamera."}, 400
+    selected = {role: value.strip() for role, value in selected.items()}
     if len(set(selected.values())) != len(camera_roles):
         return {"error": "Vælg to forskellige kameraer."}, 400
     try:
-        available = {entity["id"] for entity in camera_entities() if entity["available"]}
-        if not set(selected.values()) <= available:
-            return {"error": "Et valgt kamera er utilgængeligt i Home Assistant."}, 400
+        proposed = {role: SnapshotCamera(url) for role, url in selected.items()}
+        def check_camera(role):
+            try:
+                raw = proposed[role].snapshot()
+                if cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR) is None:
+                    raise ValueError("Adressen returnerede ikke et stillbillede.")
+            except (ValueError, cv2.error) as exc:
+                name = "Venstre kamera" if role == "left" else "Højre kamera"
+                raise ValueError(f"{name}: {exc}") from exc
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            list(pool.map(check_camera, camera_roles))
         with lock:
-            if selected != camera_selection():
+            if selected != {role: camera.url for role, camera in cameras.items()}:
                 temp = camera_path.with_suffix(".tmp")
                 temp.write_text(json.dumps(selected))
                 temp.replace(camera_path)
-                cameras = {role: EntityCamera(entity_id) for role, entity_id in selected.items()}
+                cameras = proposed
                 reference = empty_board = mappings = manual_mappings = pending = startup_frames = None
                 clear_frames = 0
                 darts.clear()
                 status = "Kameraer gemt. Kalibrér med tom skive."
                 if entities:
                     entities.reset_turn()
-        return {"selected": selected}
+        return {"saved": True}
     except (OSError, ValueError) as exc:
         return {"error": str(exc)}, 502
 
@@ -353,6 +356,7 @@ def select_cameras():
 def index():
     return render_template(
         "index.html", configured=bool(cameras), selection=camera_selection(),
+        camera_urls={role: camera.url for role, camera in cameras.items()},
         board={"sectors": sectors, "bull_inner": bull_inner, "bull_outer": bull_outer,
                "treble_inner": treble_inner, "treble_outer": treble_outer,
                "double_inner": double_inner, "double_outer": double_outer,
@@ -831,8 +835,11 @@ if __name__ == "__main__":
     options = json.loads(options_path.read_text())
     if camera_path.exists():
         selected = json.loads(camera_path.read_text())
-        cameras = {role: EntityCamera(selected[role]) for role in camera_roles}
-        status = "Start med tom skive."
+        try:
+            cameras = {role: SnapshotCamera(selected[role]) for role in camera_roles}
+            status = "Start med tom skive."
+        except (KeyError, ValueError):
+            status = "Indtast snapshotadresserne under Kameraer."
     if options.get("mqtt_host"):
         entities = DartEntities(options)
     Thread(target=watch_board, daemon=True).start()
