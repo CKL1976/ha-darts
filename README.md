@@ -11,10 +11,9 @@ Start appen og åbn webgrænsefladen.
 
 ## Første tur
 
-1. Tøm skiven, og vælg Kalibrér. Vælg krydset på dobbeltringens
-   **inderste** wire ved 5/20, 13/6, 17/3 og 8/11. Sæt X i zoomvinduet
-   dér, hvor rød/grøn møder sort/hvid. Bekræft krydset for begge kameraer. Kontrollér derefter de beregnede
-   wirer på begge billeder, og vælg Gem kalibrering.
+1. Tøm skiven, og vælg Kalibrér. Markér de fire kryds på dobbeltringens
+   inderste wire, de samme fire sektorgrænser på tripelringens yderste wire
+   og centrum af bull. Ret valgfri punkter i zoomvisningen før du gemmer.
 2. Vælg Start tur med tom skive. Ældre kalibreringer bruger stadig den
    yderste wire, indtil du gennemfører en ny kalibrering.
 3. Kast én pil, og vent på scoren, før du kaster igen. Appen analyserer
@@ -28,16 +27,7 @@ Angiv brokerens adresse i `mqtt_host` samt port og eventuelt login under
 appens Konfiguration. MQTT-integrationen i Home Assistant skal være på den
 samme broker og bruge samme discovery-prefix. Lad `mqtt_host` stå tom for
 at køre appen uden MQTT. Forbindelsesstatus vises i appens webvisning.
-Sensorernes rå værdier sendes på `ha_darts/sensor/+`.
-
-Appen registrerer tre sensorer og to billedentiteter under enheden HA Darts:
-
-- `sensor.ha_darts_seneste_kast`
-- `sensor.ha_darts_antal_pile`
-- `sensor.ha_darts_tur_score`
-- `image.ha_darts_venstre`
-- `image.ha_darts_hoejre`
-
-Scoren opdateres ved godkendte kast og nulstilling. Billeder sendes ved
-billedhentning, turstart og godkendte kast. Brokeren gemmer de seneste
-billeder på de to MQTT-emner, så de kan vises efter genstart af Home Assistant.
+Den eneste MQTT-entitet er `sensor.ha_darts_seneste_kast`. Den viser
+point for den senest godkendte pil, fx 60 for T20. Tidligere HA Darts-entiteter
+fjernes via MQTT Discovery, når appen forbinder til samme broker og prefix.
+MQTT-emnet er `ha_darts/sensor/seneste_kast`.

@@ -60,16 +60,29 @@ def capture_pair():
         return list(pool.map(capture, sides))
 
 
-def transform(points, radius=170):
+def calibration_geometry(points, radius):
     source = np.asarray(points, dtype=np.float32)
-    if source.shape != (4, 2) or not np.isfinite(source).all():
-        raise ValueError("Vælg fire punkter for hvert kamera.")
-    if not cv2.isContourConvex(source) or cv2.contourArea(source) < 100:
-        raise ValueError("Kalibreringspunkterne ligger forkert.")
-    # Double-ring intersections, clockwise from the 5/20 wire.
+    if source.shape not in ((4, 2), (9, 2)) or not np.isfinite(source).all():
+        raise ValueError("Ugyldige kalibreringspunkter.")
+    if not cv2.isContourConvex(source[:4]) or cv2.contourArea(source[:4]) < 100:
+        raise ValueError("De fire punkter på dobbeltringen ligger forkert.")
     radians = np.deg2rad((-9, 81, 171, 261))
-    target = radius * np.column_stack((np.sin(radians), -np.cos(radians)))
-    return cv2.getPerspectiveTransform(source, target.astype(np.float32))
+    directions = np.column_stack((np.sin(radians), -np.cos(radians)))
+    target = radius * directions
+    if len(source) == 9:
+        target = np.vstack((target, 107 * directions, [0, 0]))
+    return source, target.astype(np.float32)
+
+
+def transform(points, radius=170):
+    source, target = calibration_geometry(points, radius)
+    if len(source) == 4:
+        return cv2.getPerspectiveTransform(source, target)
+    # Fit in pixel space, where the manual clicks introduce measurement error.
+    inverse, _ = cv2.findHomography(target, source, method=0)
+    if inverse is None or not np.isfinite(inverse).all():
+        raise ValueError("Kunne ikke tilpasse kalibreringen.")
+    return np.linalg.inv(inverse)
 
 
 def field_at(x, y):
@@ -214,8 +227,6 @@ def image(side):
         with lock:
             frame = capture(side)
             jpeg = encode_image(frame)
-            if entities:
-                entities.update_image(side, jpeg)
         return Response(jpeg, mimetype="image/jpeg",
                         headers={"Cache-Control": "no-store"})
     except (OSError, ValueError, cv2.error) as exc:
@@ -226,18 +237,6 @@ def turn_state():
     return {"darts": list(darts), "total": sum(d["points"] for d in darts),
             "status": status,
             "mqtt": entities.connection_status if entities else "Angiv mqtt_host i Konfiguration"}
-
-
-def publish_turn(frames=None):
-    if not entities:
-        return
-    entities.update_turn(darts)
-    if frames is not None:
-        for side, frame in zip(sides, frames):
-            try:
-                entities.update_image(side, encode_image(frame))
-            except (ValueError, cv2.error):
-                app.logger.warning("Kunne ikke publicere kamerabillede fra %s", side)
 
 
 def board_is_clear(frames):
@@ -262,7 +261,6 @@ def analyze_frames(frames):
             reference = frames
             if darts:
                 darts.clear()
-                publish_turn(frames)
             status = "Klar. Kast en pil."
         return
 
@@ -283,7 +281,8 @@ def analyze_frames(frames):
     reference = frames
     pending = None
     status = "Tur slut. Fjern pilene." if len(darts) == 3 else "Klar til næste pil."
-    publish_turn(frames)
+    if entities:
+        entities.update_throw(hit["points"])
 
 
 def watch_board():
@@ -326,13 +325,17 @@ def calibration_preview():
             direction = np.float32([np.sin(angle), -np.cos(angle)])
             spokes.append(np.float32([direction * 15.9, direction * 170]))
         overlay = {}
+        errors = {}
         for side in sides:
             inverse = np.linalg.inv(transform(data[side], radius=162))
+            source, target = calibration_geometry(data[side], 162)
+            projected = cv2.perspectiveTransform(target[None], inverse)[0]
+            errors[side] = np.round(np.linalg.norm(projected - source, axis=1), 1).tolist()
             overlay[side] = [
                 cv2.perspectiveTransform(line[None], inverse)[0].tolist()
                 for line in rings + spokes
             ]
-        return overlay
+        return {**overlay, "errors": errors}
     except (KeyError, TypeError, ValueError, cv2.error, np.linalg.LinAlgError) as exc:
         return {"error": str(exc)}, 400
 
@@ -370,7 +373,6 @@ def act(action):
         pending = None
         clear_frames = 0
         darts.clear()
-        publish_turn(frames)
         return turn_state()
 
 

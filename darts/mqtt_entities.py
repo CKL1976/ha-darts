@@ -1,4 +1,4 @@
-"""Publish the current turn and camera snapshots via MQTT discovery."""
+"""Publish the last scored dart via MQTT discovery."""
 
 import json
 import logging
@@ -8,19 +8,20 @@ import paho.mqtt.client as mqtt
 
 LOGGER = logging.getLogger(__name__)
 BASE = "ha_darts"
-SENSORS = {
-    "seneste_kast": ("Seneste kast", "last_throw"),
-    "antal_pile": ("Antal pile", "count"),
-    "tur_score": ("Tur score", "total"),
-}
-IMAGES = {"left": ("venstre", "Venstre"), "right": ("hoejre", "Højre")}
+SENSOR = "seneste_kast"
+STATE_TOPIC = f"{BASE}/sensor/{SENSOR}"
+OBSOLETE = (
+    ("sensor", "antal_pile", f"{BASE}/sensor/antal_pile"),
+    ("sensor", "tur_score", f"{BASE}/sensor/tur_score"),
+    ("image", "venstre", f"{BASE}/image/left"),
+    ("image", "hoejre", f"{BASE}/image/right"),
+)
 
 
 class DartEntities:
     def __init__(self, options):
         self.lock = Lock()
-        self.state = {"last_throw": "—", "count": 0, "total": 0}
-        self.images = {}
+        self.last_score = "unknown"
         self.discovery_prefix = options.get("mqtt_discovery_prefix", "homeassistant")
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
         if options.get("mqtt_username"):
@@ -47,47 +48,29 @@ class DartEntities:
             return
         with self.lock:
             self.connection_status = "Forbundet"
-            for key, (name, _) in SENSORS.items():
-                self.discover("sensor", key, name, {
-                    "state_topic": f"{BASE}/sensor/{key}",
-                })
-            for side, (key, name) in IMAGES.items():
-                self.discover("image", key, name, {"image_topic": f"{BASE}/image/{side}"})
-            self.publish_turn()
-            for side, jpeg in self.images.items():
-                self.publish_image(side, jpeg)
+            for platform, key, topic in OBSOLETE:
+                self.send(self.discovery_topic(platform, key), b"")
+                self.send(topic, b"")
+            self.send(f"{BASE}/turn", b"")
+            self.send(self.discovery_topic("sensor", SENSOR), json.dumps({
+                "name": "Seneste kast",
+                "unique_id": f"{BASE}_{SENSOR}",
+                "default_entity_id": f"sensor.{BASE}_{SENSOR}",
+                "state_topic": STATE_TOPIC,
+                "device": {"identifiers": [BASE], "name": "HA Darts"},
+            }))
+            self.send(STATE_TOPIC, self.last_score)
 
-    def discover(self, platform, key, name, config):
-        identifier = f"ha_darts_{key}"
-        config.update(name=name, unique_id=identifier,
-                      default_entity_id=f"{platform}.{identifier}",
-                      device={"identifiers": [BASE], "name": "HA Darts"})
-        topic = f"{self.discovery_prefix}/{platform}/{identifier}/config"
-        self.client.publish(topic, json.dumps(config), qos=1, retain=True)
+    def discovery_topic(self, platform, key):
+        return f"{self.discovery_prefix}/{platform}/{BASE}_{key}/config"
 
-    def publish_turn(self):
-        self.client.publish(f"{BASE}/turn", json.dumps(self.state), qos=1, retain=True)
-        for key, (_, field) in SENSORS.items():
-            result = self.client.publish(f"{BASE}/sensor/{key}", str(self.state[field]),
-                                         qos=1, retain=True)
-            if result.rc != mqtt.MQTT_ERR_SUCCESS:
-                LOGGER.warning("MQTT: failed to queue %s (code %s)", key, result.rc)
+    def send(self, topic, payload):
+        result = self.client.publish(topic, payload, qos=1, retain=True)
+        if result.rc != mqtt.MQTT_ERR_SUCCESS:
+            LOGGER.warning("MQTT: failed to queue %s (code %s)", topic, result.rc)
 
-    def publish_image(self, side, jpeg):
-        self.client.publish(f"{BASE}/image/{side}", jpeg, qos=1, retain=True)
-
-    def update_turn(self, darts):
+    def update_throw(self, points):
         with self.lock:
-            self.state = {
-                "last_throw": darts[-1]["field"] if darts else "—",
-                "count": len(darts),
-                "total": sum(dart["points"] for dart in darts),
-            }
+            self.last_score = str(points)
             if self.client.is_connected():
-                self.publish_turn()
-
-    def update_image(self, side, jpeg):
-        with self.lock:
-            self.images[side] = jpeg
-            if self.client.is_connected():
-                self.publish_image(side, jpeg)
+                self.send(STATE_TOPIC, self.last_score)

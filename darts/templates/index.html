@@ -26,7 +26,8 @@ canvas{display:block;width:100%;height:auto;cursor:crosshair;margin-bottom:14px}
 <p>MQTT: <span id="mqtt">Henter status</span></p>
 <div id="review" hidden>
 <button id="saveCalibration">Gem kalibrering</button>
-<button id="redoPoint">Ret sidste kryds</button>
+<label for="editPoint">Ret punkt</label> <select id="editPoint"></select>
+<button id="redoPoint">Markér igen</button>
 </div>
 <output id="status" aria-live="polite"></output>
 <div class="views">
@@ -35,7 +36,7 @@ canvas{display:block;width:100%;height:auto;cursor:crosshair;margin-bottom:14px}
 </div>
 <dialog id="zoom">
 <h2 id="zoomTitle"></h2>
-<p>Sæt X midt i krydset, hvor de røde og grønne dobbeltfelter møder de sorte og hvide felter.</p>
+<p>Sæt X midt i det angivne wirekryds eller i bullens centrum.</p>
 <canvas id="crop" width="420" height="420" aria-label="Forstørret kamerabillede"></canvas>
 <button id="confirm" disabled>Bekræft punkt</button>
 <button id="cancelZoom">Vælg udsnit igen</button>
@@ -44,6 +45,15 @@ canvas{display:block;width:100%;height:auto;cursor:crosshair;margin-bottom:14px}
 const get = id => document.getElementById(id);
 const sides = ["left", "right"];
 const wires = ["5/20", "13/6", "17/3", "8/11"];
+const labels = [
+  ...wires.map(wire => "Inderste dobbeltwire " + wire),
+  ...wires.map(wire => "Yderste tripelwire " + wire),
+  "Midten af bull"
+];
+for (const [index, label] of labels.entries()) {
+  get("editPoint").add(new Option(label, index));
+}
+let editing = null;
 let points = null, busy = false, lastTurn = null;
 let zoom = null;
 let overlayReady = false;
@@ -52,7 +62,7 @@ const canvas = get("crop");
 const context = canvas.getContext("2d");
 function controls() {
   get("reset").disabled = busy || !!points;
-  const reviewing = points?.left.length === 4 && points?.right.length === 4;
+  const reviewing = editing === null && points?.left.length === labels.length && points?.right.length === labels.length;
   get("review").hidden = !reviewing;
   get("saveCalibration").disabled = busy || !overlayReady;
   get("redoPoint").disabled = busy;
@@ -113,14 +123,15 @@ async function poll() {
 }
 
 function prompt() {
-  const step = Math.min(points.left.length, points.right.length);
-  get("status").textContent = "Kalibrér mellem " +
-    wires[step] + ". Klik nær krydset på dobbeltringens inderste wire i begge billeder.";
+  const step = editing?.index ?? Math.min(points.left.length, points.right.length);
+  get("status").textContent = (step + 1) + "/" + labels.length + ": " +
+    labels[step] + ". Markér punktet i begge billeder.";
 }
 get("reset").onclick = () => run(() => action("reset"));
 get("refresh").onclick = () => run(refresh);
 get("calibrate").onclick = () => run(async () => {
   points = points ? null : {left:[], right:[]};
+  editing = null;
   hideOverlay();
   get("status").textContent = "";
   if (points) {
@@ -129,9 +140,9 @@ get("calibrate").onclick = () => run(async () => {
   }
 });
 for (const side of sides) get(side).onclick = event => {
-  if (!points || busy || points[side].length === 4) return;
+  if (!points || busy || (editing ? editing.done.has(side) : points[side].length === labels.length)) return;
   const other = side === "left" ? "right" : "left";
-  if (points[side].length > points[other].length) return;
+  if (!editing && points[side].length > points[other].length) return;
   const img = event.currentTarget;
   if (!img.naturalWidth) return;
   const rect = img.getBoundingClientRect();
@@ -143,7 +154,7 @@ for (const side of sides) get(side).onclick = event => {
     x: Math.max(0, Math.min(x - size / 2, img.naturalWidth - size)),
     y: Math.max(0, Math.min(y - size / 2, img.naturalHeight - size))
   };
-  get("zoomTitle").textContent = wires[points[side].length] + " · " +
+  get("zoomTitle").textContent = labels[editing?.index ?? points[side].length] + " · " +
     (side === "left" ? "Venstre kamera" : "Højre kamera");
   drawCrop();
   get("zoom").showModal();
@@ -175,11 +186,18 @@ get("zoom").onclose = () => { zoom = null; };
 get("confirm").onclick = () => {
   if (!zoom?.selected) return;
   const {side, x, y, size, selected} = zoom;
-  points[side].push([x + selected[0] * size, y + selected[1] * size]);
+  const point = [x + selected[0] * size, y + selected[1] * size];
+  if (editing) {
+    points[side][editing.index] = point;
+    editing.done.add(side);
+    if (editing.done.size === sides.length) editing = null;
+  } else {
+    points[side].push(point);
+  }
   get("zoom").close();
-  if (points.left.length === 4 && points.right.length === 4) {
+  if (!editing && points.left.length === labels.length && points.right.length === labels.length) {
     run(previewCalibration);
-  } else if (points.left.length === points.right.length) prompt();
+  } else if (!editing && points.left.length === points.right.length) prompt();
   else get("status").textContent = "Vælg og bekræft samme punkt i det andet billede.";
 };
 function hideOverlay() {
@@ -210,11 +228,15 @@ async function previewCalibration() {
     layer.hidden = false;
   }
   overlayReady = true;
-  get("status").textContent = "Kontrollér, om de blå linjer følger wirerne på begge billeder.";
+  const worst = side => Math.max(...data.errors[side]).toFixed(1);
+  get("status").textContent = "Kontrollér de blå linjer. Største afvigelse: venstre " +
+    worst("left") + " px, højre " + worst("right") + " px.";
+  const combined = labels.map((_, index) => Math.max(...sides.map(side => data.errors[side][index])));
+  get("editPoint").selectedIndex = combined.indexOf(Math.max(...combined));
 }
 get("redoPoint").onclick = () => {
   hideOverlay();
-  for (const side of sides) points[side].pop();
+  editing = {index: Number(get("editPoint").value), done: new Set()};
   prompt();
   controls();
 };
