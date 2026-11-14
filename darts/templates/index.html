@@ -16,6 +16,8 @@ canvas{display:block;width:100%;height:auto;cursor:crosshair;margin-bottom:14px}
 .camera-frame{position:relative}
 .camera-frame canvas{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;margin:0}
 #dartboard{cursor:default;background:#101716;margin:0}
+.camera-frame canvas.editable{pointer-events:auto;touch-action:none;cursor:grab}
+#crop{touch-action:none}
 </style>
 <h1>HA Darts</h1>
 <p><strong id="score">0 point</strong> <span id="throws"></span></p>
@@ -27,6 +29,7 @@ canvas{display:block;width:100%;height:auto;cursor:crosshair;margin-bottom:14px}
 </div>
 <p>MQTT: <span id="mqtt">Henter status</span></p>
 <div id="review" hidden>
+<span>Træk de gule punkter for at flytte de blå linjer. Klik på et punkt for zoom.</span>
 <button id="saveCalibration">Gem kalibrering</button>
 <label for="editPoint">Ret punkt</label> <select id="editPoint"></select>
 <button id="redoPoint">Markér igen</button>
@@ -82,6 +85,8 @@ let editing = null;
 let points = null, busy = false;
 let zoom = null;
 let overlayReady = false;
+let previewData = null;
+let drag = null;
 const cropSize = 120;
 const canvas = get("crop");
 const context = canvas.getContext("2d");
@@ -245,23 +250,27 @@ for (const side of sides) get(side).onclick = event => {
   const rect = img.getBoundingClientRect();
   const x = (event.clientX - rect.left) * img.naturalWidth / rect.width;
   const y = (event.clientY - rect.top) * img.naturalHeight / rect.height;
+  openZoom(side, x, y, editing?.index ?? points[side].length);
+};
+function openZoom(side, x, y, index, single = false) {
+  const img = get(side);
   const size = Math.min(cropSize, img.naturalWidth, img.naturalHeight);
   zoom = {
-    side, img, size, selected: null,
+    side, img, size, index, single, selected: null,
     x: Math.max(0, Math.min(x - size / 2, img.naturalWidth - size)),
     y: Math.max(0, Math.min(y - size / 2, img.naturalHeight - size))
   };
-  get("zoomTitle").textContent = labels[editing?.index ?? points[side].length] + " · " +
+  get("zoomTitle").textContent = labels[index] + " · " +
     cameraNames[side];
-  if (editing) {
-    const [oldX, oldY] = points[side][editing.index];
+  if (editing || single) {
+    const [oldX, oldY] = points[side][index];
     if (oldX >= zoom.x && oldX < zoom.x + size && oldY >= zoom.y && oldY < zoom.y + size) {
       zoom.selected = [(oldX - zoom.x) / size, (oldY - zoom.y) / size];
     }
   }
   drawCrop();
   get("zoom").showModal();
-};
+}
 function drawCrop() {
   context.drawImage(zoom.img, zoom.x, zoom.y, zoom.size, zoom.size,
                     0, 0, canvas.width, canvas.height);
@@ -278,11 +287,16 @@ function drawCrop() {
   context.strokeStyle = "#ffff00";
   context.stroke();
 }
-canvas.onclick = event => {
-  const rect = canvas.getBoundingClientRect();
-  zoom.selected = [(event.clientX - rect.left) / rect.width,
-                   (event.clientY - rect.top) / rect.height];
+function moveZoomPoint(event) {
+  zoom.selected = imagePosition(canvas, event, 1, 1);
   drawCrop();
+}
+canvas.onpointerdown = event => {
+  canvas.setPointerCapture(event.pointerId);
+  moveZoomPoint(event);
+};
+canvas.onpointermove = event => {
+  if (canvas.hasPointerCapture(event.pointerId)) moveZoomPoint(event);
 };
 get("cancelZoom").onclick = () => get("zoom").close();
 get("zoom").onclose = () => { zoom = null; };
@@ -290,6 +304,12 @@ get("confirm").onclick = () => {
   if (!zoom?.selected) return;
   const {side, x, y, size, selected} = zoom;
   const point = [x + selected[0] * size, y + selected[1] * size];
+  if (zoom.single) {
+    const index = zoom.index;
+    get("zoom").close();
+    run(() => moveControlPoint(side, index, point));
+    return;
+  }
   if (editing) {
     points[side][editing.index] = point;
     editing.done.add(side);
@@ -305,16 +325,20 @@ get("confirm").onclick = () => {
 };
 function hideOverlay() {
   overlayReady = false;
-  for (const side of sides) get(side + "Overlay").hidden = true;
-}
-async function previewCalibration(automatic = false) {
-  const response = await fetch("calibration-preview", {
-    method: "POST", headers: {"Content-Type": "application/json"},
-    body: JSON.stringify(points)
-  });
-  const data = await response.json();
-  if (!response.ok) throw Error(data.error);
+  previewData = null;
   for (const side of sides) {
+    const layer = get(side + "Overlay");
+    layer.hidden = true;
+    layer.classList.remove("editable");
+  }
+}
+function imagePosition(element, event, width, height) {
+  const rect = element.getBoundingClientRect();
+  return [Math.max(0, Math.min(width, (event.clientX - rect.left) * width / rect.width)),
+          Math.max(0, Math.min(height, (event.clientY - rect.top) * height / rect.height))];
+}
+function paintOverlay(side) {
+  const data = previewData;
     const img = get(side);
     const layer = get(side + "Overlay");
     layer.width = img.naturalWidth;
@@ -338,8 +362,26 @@ async function previewCalibration(automatic = false) {
       pen.strokeText(data.numbers[index], x, y);
       pen.fillText(data.numbers[index], x, y);
     }
+    const radius = 5 * layer.width / Math.max(1, img.clientWidth);
+    pen.fillStyle = "#ffff00";
+    for (const [index, point] of points[side].entries()) {
+      const [x, y] = drag?.side === side && drag.index === index ? drag.point : point;
+      pen.beginPath();
+      pen.arc(x, y, radius, 0, 2 * Math.PI);
+      pen.fill();
+    }
     layer.hidden = false;
-  }
+    layer.classList.add("editable");
+}
+async function previewCalibration(automatic = false) {
+  const response = await fetch("calibration-preview", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(points)
+  });
+  const data = await response.json();
+  if (!response.ok) throw Error(data.error);
+  previewData = data;
+  for (const side of sides) paintOverlay(side);
   overlayReady = true;
   const worst = side => Math.max(...data.errors[side]).toFixed(1);
   get("status").textContent = "Sammenlign de blå wirer og tal med skiven. Største afvigelse: " +
@@ -347,6 +389,59 @@ async function previewCalibration(automatic = false) {
   if (automatic) get("status").textContent = "Automatisk forslag. Kontrollér de blå wirer og tal, før du gemmer.";
   const combined = labels.map((_, index) => Math.max(...sides.map(side => data.errors[side][index])));
   get("editPoint").selectedIndex = combined.indexOf(Math.max(...combined));
+}
+async function moveControlPoint(side, index, point) {
+  const original = points[side][index];
+  points[side][index] = point;
+  try {
+    await previewCalibration();
+  } catch (error) {
+    points[side][index] = original;
+    paintOverlay(side);
+    throw error;
+  }
+}
+for (const side of sides) {
+  const layer = get(side + "Overlay");
+  const position = event => imagePosition(layer, event, layer.width, layer.height);
+  layer.onpointerdown = event => {
+    if (busy || drag || !overlayReady || event.button !== 0) return;
+    const [x, y] = position(event);
+    const rect = layer.getBoundingClientRect();
+    const distances = points[side].map(([px, py]) =>
+      Math.hypot((px - x) * rect.width / layer.width, (py - y) * rect.height / layer.height));
+    const nearest = Math.min(...distances);
+    if (nearest > 18) return;
+    const index = distances.indexOf(nearest);
+    drag = {side, index, pointer: event.pointerId, origin: [event.clientX, event.clientY],
+            imageOrigin: [x, y], point: points[side][index]};
+    layer.setPointerCapture(event.pointerId);
+  };
+  layer.onpointermove = event => {
+    if (drag?.side !== side || drag.pointer !== event.pointerId) return;
+    const [x, y] = position(event);
+    const [px, py] = points[side][drag.index];
+    drag.point = [Math.max(0, Math.min(layer.width - 1, px + x - drag.imageOrigin[0])),
+                  Math.max(0, Math.min(layer.height - 1, py + y - drag.imageOrigin[1]))];
+    paintOverlay(side);
+  };
+  layer.onpointerup = event => {
+    if (drag?.side !== side || drag.pointer !== event.pointerId) return;
+    const {index, origin, point} = drag;
+    drag = null;
+    if (Math.hypot(event.clientX - origin[0], event.clientY - origin[1]) < 4) {
+      paintOverlay(side);
+      openZoom(side, ...points[side][index], index, true);
+    } else {
+      run(() => moveControlPoint(side, index, point));
+    }
+  };
+  layer.onlostpointercapture = () => {
+    if (drag?.side === side) {
+      drag = null;
+      paintOverlay(side);
+    }
+  };
 }
 get("redoPoint").onclick = () => {
   hideOverlay();
