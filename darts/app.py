@@ -198,53 +198,75 @@ def field_at(x, y):
 
 def match_tips(views, transforms):
     if not all(views):
-        return None
-    left, right = views
-    left_points = np.asarray(left, dtype=np.float32)
-    right_points = np.asarray(right, dtype=np.float32)
+        return []
+    left_points, right_points = (np.asarray(view, dtype=np.float32) for view in views)
     distances = np.linalg.norm(left_points[:, None] - right_points, axis=2)
-    left_index, right_index = np.unravel_index(distances.argmin(), distances.shape)
-    if distances[left_index, right_index] > 9:
-        return None
-    hit = (left_points[left_index] + right_points[right_index]) / 2
-    field, points = field_at(*hit)
-    lines_by_view = []
-    for mapping in transforms:
-        pixel = project(hit.reshape(1, 1, 2), mapping, backwards=True)[0, 0]
-        lines_by_view.append({"tip": pixel.tolist()})
-    return {"field": field, "points": points,
-            "x_mm": round(float(hit[0]), 1), "y_mm": round(float(hit[1]), 1),
-            "camera_lines": lines_by_view}
+    hits = []
+    used_left, used_right = set(), set()
+    for index in np.argsort(distances, axis=None):
+        left, right = np.unravel_index(index, distances.shape)
+        if distances[left, right] > 9 or len(hits) == 3:
+            break
+        if left in used_left or right in used_right:
+            continue
+        hit = (left_points[left] + right_points[right]) / 2
+        field, points = field_at(*hit)
+        used_left.add(left)
+        used_right.add(right)
+        lines = [
+            {"tip": project(hit.reshape(1, 1, 2), mapping, backwards=True)[0, 0].tolist()}
+            for mapping in transforms
+        ]
+        hits.append({"field": field, "points": points,
+                     "x_mm": round(float(hit[0]), 1), "y_mm": round(float(hit[1]), 1),
+                     "camera_lines": lines})
+    return hits
 
 
-def change_mask(previous, current):
-    if previous.shape != current.shape:
-        raise ValueError("Kameraets billedstørrelse har ændret sig.")
-    delta = np.abs(grayscale(previous).astype(np.int16) - grayscale(current))
-    return (delta > 30).astype(np.uint8) * 255
+# Present each camera to DeepDarts as a square, front-facing board.
+model_view_size = 480
+model_view_span = 450.0
+model_mm_per_pixel = model_view_span / model_view_size
+model_coordinates = (
+    np.indices((model_view_size, model_view_size), dtype=np.float32)[::-1].transpose(1, 2, 0)
+    - model_view_size / 2
+) * model_mm_per_pixel
 
 
-def detect_throw(before, after, mappings):
+def detect_throws(before, after, mappings):
     model = deepdarts_model
     if model is None:
         raise ValueError("Installér DeepDarts D1 for at registrere kast.")
-    views = []
+    views, counts = [], []
     for previous, frame, mapping in zip(before, after, mappings):
-        mask = change_mask(previous, frame)
+        if previous.shape != frame.shape:
+            raise ValueError("Kameraets billedstørrelse har ændret sig.")
+        coordinates = project(model_coordinates, mapping, backwards=True)
+        board = np.stack([sample_image(channel, coordinates, order=1)
+                          for channel in frame.transpose(2, 0, 1)], axis=-1)
+        tips = model.tips(board)
         candidates = []
-        for tip in model.tips(frame):
-            x, y = np.rint(tip).astype(int)
-            if not mask[max(y-8, 0):y+9, max(x-8, 0):x+9].any():
+        for tip in tips:
+            point = (tip - model_view_size / 2) * model_mm_per_pixel
+            if field_at(*point)[0] == "MISS":
                 continue
-            point = project(tip.reshape(1, 1, 2), mapping)[0, 0]
-            if np.isfinite(point).all() and field_at(*point)[0] != "MISS":
+            pixel = project(point.reshape(1, 1, 2), mapping, backwards=True)[0, 0]
+            if not np.isfinite(pixel).all():
+                continue
+            x, y = np.rint(pixel).astype(int)
+            height, width = frame.shape[:2]
+            if not (0 <= x < width and 0 <= y < height):
+                continue
+            region = np.s_[max(0, y-16):y+17, max(0, x-16):x+17]
+            delta = np.abs(previous[region].astype(np.int16) - frame[region])
+            if np.count_nonzero(delta.max(axis=2) > 25) >= 4:
                 candidates.append(point)
         views.append(candidates)
-    hit = match_tips(views, mappings)
-    if hit is None:
-        counts = "/".join(str(len(view)) for view in views)
-        raise ValueError(f"DeepDarts fandt intet fælles træf. Kandidater pr. kamera: {counts}.")
-    return hit
+        counts.append(f"{len(tips)} fundet, {len(candidates)} nye")
+    hits = match_tips(views, mappings)
+    if not hits:
+        raise ValueError(f"DeepDarts fandt intet fælles træf. Venstre: {counts[0]}. Højre: {counts[1]}.")
+    return hits
 
 
 @app.post("/deepdarts/download")
@@ -407,20 +429,23 @@ def analyze_frames(frames):
     if len(darts) >= 3:
         status = "Tur slut. Fjern pilene."
         return
-    hit = detect_throw(reference, frames, mappings)
+    hits = detect_throws(reference, frames, mappings)[:3-len(darts)]
     previous = pending
-    pending = hit
-    if previous is None or previous["field"] != hit["field"] or math.hypot(
-        previous["x_mm"] - hit["x_mm"], previous["y_mm"] - hit["y_mm"]
-    ) > 6:
-        status = f"Bekræfter {hit['field']}."
+    pending = hits
+    if previous is None or len(previous) != len(hits) or any(
+        not any(old["field"] == hit["field"] and math.hypot(
+            old["x_mm"] - hit["x_mm"], old["y_mm"] - hit["y_mm"]
+        ) <= 6 for old in previous) for hit in hits
+    ):
+        status = f"Bekræfter {len(hits)} træf."
         return
-    darts.append(hit)
     reference = frames
     pending = None
+    for hit in hits:
+        darts.append(hit)
+        if entities:
+            entities.update_throw(hit["points"], len(darts))
     status = "Tur slut. Fjern pilene." if len(darts) == 3 else "Klar til næste pil."
-    if entities:
-        entities.update_throw(hit["points"], len(darts))
 
 
 def refine_empty_board(frames):
