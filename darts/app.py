@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import json
 import math
 from concurrent.futures import ThreadPoolExecutor
@@ -21,6 +22,7 @@ lock = Lock()
 options_path = Path("/data/options.json")
 calibration_path = Path("/data/calibration.json")
 camera_path = Path("/data/cameras.json")
+empty_path = Path("/data/empty-board.npz")
 camera_roles = ("left", "right")
 sectors = (20, 1, 18, 4, 13, 6, 10, 15, 2, 17, 3, 19, 7, 16, 8, 11, 14, 9, 12, 5)
 sector_angle = 360 / len(sectors)
@@ -35,6 +37,7 @@ manual_mappings = None
 next_refinement = 0
 pending = None
 clear_frames = 0
+startup_frames = None
 status = "Vælg dine tre Home Assistant-kameraer."
 darts = []
 entities = None
@@ -309,7 +312,7 @@ def list_cameras():
 
 @app.post("/cameras")
 def select_cameras():
-    global cameras, reference, empty_board, mappings, manual_mappings, pending, clear_frames, status
+    global cameras, reference, empty_board, mappings, manual_mappings, pending, clear_frames, startup_frames, status
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         return {"error": "Vælg et kamera til hver rolle."}, 400
@@ -328,7 +331,7 @@ def select_cameras():
                 temp.write_text(json.dumps(selected))
                 temp.replace(camera_path)
                 cameras = {role: EntityCamera(entity_id) for role, entity_id in selected.items()}
-                reference = empty_board = mappings = manual_mappings = pending = None
+                reference = empty_board = mappings = manual_mappings = pending = startup_frames = None
                 clear_frames = 0
                 darts.clear()
                 status = "Kameraer gemt. Kalibrér med tom skive."
@@ -384,8 +387,8 @@ def turn_state():
             "mqtt": entities.connection_status if entities else "Angiv mqtt_host i Konfiguration"}
 
 
-def board_is_clear(frames):
-    for baseline, frame in zip(empty_board, frames):
+def board_is_clear(frames, baseline_frames):
+    for baseline, frame in zip(baseline_frames, frames):
         if baseline.shape != frame.shape:
             raise ValueError("Kameraets billedstørrelse har ændret sig.")
         delta = cv2.cvtColor(cv2.absdiff(baseline, frame), cv2.COLOR_BGR2GRAY)
@@ -399,7 +402,7 @@ def board_is_clear(frames):
 
 def analyze_frames(frames):
     global reference, pending, clear_frames, status
-    if board_is_clear(frames):
+    if board_is_clear(frames, empty_board):
         pending = None
         clear_frames += 1
         if clear_frames >= 2:
@@ -413,6 +416,8 @@ def analyze_frames(frames):
         return
 
     clear_frames = 0
+    if pending is None and darts and board_is_clear(frames, reference):
+        return
     if len(darts) >= 3:
         status = "Tur slut. Fjern pilene."
         return
@@ -455,24 +460,64 @@ def refine_empty_board(frames):
             continue
 
 
+def calibration_signature():
+    return hashlib.sha256(calibration_path.read_bytes()).hexdigest()
+
+
+def store_empty_board(frames):
+    temp = empty_path.with_name("empty-board.tmp.npz")
+    np.savez_compressed(temp, signature=calibration_signature(), **dict(zip(camera_roles, frames)))
+    temp.replace(empty_path)
+
+
+def prepare_board(frames, points):
+    global reference, empty_board, mappings, manual_mappings, startup_frames, status
+    radius = double_inner if points.get("ring") == "inner_double" else double_outer
+    if empty_board is None and empty_path.exists():
+        try:
+            with np.load(empty_path, allow_pickle=False) as saved:
+                if saved["signature"].item() == calibration_signature():
+                    baseline = [saved[role] for role in camera_roles]
+                    if all(a.shape == b.shape for a, b in zip(baseline, frames)):
+                        empty_board = baseline
+        except (OSError, ValueError, KeyError):
+            pass
+    if empty_board is None:
+        status = "Hold skiven tom, mens appen gør klar til første tur."
+        if startup_frames is None or not board_is_clear(frames, startup_frames):
+            startup_frames = frames
+            return
+    elif not board_is_clear(frames, empty_board):
+        status = "Fjern pilene for at starte en ny tur."
+        return
+    manual_mappings = [transform(points[side], radius) for side in camera_roles]
+    mappings = manual_mappings.copy()
+    if empty_board is None:
+        store_empty_board(frames)
+        empty_board = frames
+    reference = frames
+    startup_frames = None
+    if entities:
+        entities.reset_turn()
+    status = "Klar. Kast en pil."
+
+
 def watch_board():
-    global pending, clear_frames, status
+    global pending, clear_frames, startup_frames, status
     while True:
         sleep(1)
         with lock:
-            if reference is None:
+            if not cameras or not calibration_path.exists():
                 continue
             try:
-                frames = capture_pair()
-                if pending is None and all(a.shape == b.shape and np.count_nonzero(
-                    cv2.cvtColor(cv2.absdiff(a, b), cv2.COLOR_BGR2GRAY) > 30
-                ) < 180 for a, b in zip(reference, frames)) and darts and not clear_frames:
-                    pending = None
-                    status = "Tur slut. Fjern pilene." if len(darts) == 3 else "Klar til næste pil."
-                    continue
-                analyze_frames(frames)
-            except (OSError, ValueError, cv2.error, np.linalg.LinAlgError) as exc:
+                if reference is None:
+                    points = saved_calibration()
+                    prepare_board(capture_pair(), points)
+                else:
+                    analyze_frames(capture_pair())
+            except (OSError, ValueError, KeyError, cv2.error, np.linalg.LinAlgError) as exc:
                 pending = None
+                startup_frames = None
                 clear_frames = 0
                 status = str(exc)
 
@@ -733,7 +778,7 @@ def calibration_preview():
 @app.post("/action/<action>")
 def act(action):
     global reference, empty_board, mappings, manual_mappings, next_refinement
-    global pending, clear_frames, status
+    global pending, clear_frames, startup_frames, status
     with lock:
         frames = None
         try:
@@ -749,13 +794,15 @@ def act(action):
                 temp.write_text(json.dumps({**points, "ring": "inner_double",
                                             "camera_entities": camera_selection()}))
                 temp.replace(calibration_path)
-                reference = None
-                status = "Kalibrering gemt. Start med tom skive."
+                reference = empty_board = mappings = manual_mappings = startup_frames = None
+                next_refinement = 0
+                status = "Kalibrering gemt. Hold skiven tom."
             elif action == "reset":
                 points = saved_calibration()
                 radius = double_inner if points.get("ring") == "inner_double" else double_outer
                 new_mappings = [transform(points[side], radius) for side in cameras]
                 frames = capture_pair()
+                store_empty_board(frames)
                 manual_mappings = new_mappings
                 mappings = new_mappings.copy()
                 next_refinement = 0

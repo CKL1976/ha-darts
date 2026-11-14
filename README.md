@@ -21,12 +21,13 @@ Installér og start HA Darts, og åbn appens webgrænseflade.
 1. Tøm skiven, og vælg **Kalibrér 9 punkter**. Markér de fire kryds på dobbeltringens
    inderste wire, de samme fire sektorgrænser på tripelringens yderste wire
    og centrum af bull. Ret valgfri punkter i zoomvisningen før du gemmer.
-2. Vælg Start tur med tom skive. Ældre kalibreringer bruger stadig den
-   yderste wire, indtil du gennemfører en ny kalibrering.
+2. Hold skiven tom, indtil appen viser **Klar. Kast en pil.**
 3. Kast én pil, og vent på scoren, før du kaster igen. Appen analyserer
    automatisk og tæller op til tre pile, også når webvisningen er lukket.
 4. Fjern alle pile. Appen starter næste tur, når den genkender den tomme
-   skive i begge kameraer. Efter genstart skal du starte med tom skive igen.
+   skive i begge kameraer. Markeringer og point ryddes automatisk. Ved første
+   start efter opdatering eller ny kalibrering skal skiven være tom, så appen
+   kan gemme referencebilleder til automatisk start efter genstart.
 
 ## MQTT-entiteter
 
