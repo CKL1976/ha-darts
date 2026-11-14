@@ -8,8 +8,9 @@ from time import time
 from uuid import uuid4
 from zipfile import ZipFile, ZIP_DEFLATED
 
-import cv2
 from flask import Blueprint, Response, abort, render_template, request
+
+from imaging import encode_image
 
 diagnostics = Blueprint("diagnostics", __name__)
 root = Path("/data/detection-samples")
@@ -36,8 +37,7 @@ def capture_sample(before, after, prediction, calibration, cameras, *, manual=Fa
         try:
             for stage, frames in (("before", before), ("after", after)):
                 for side, frame in zip(("left", "right"), frames):
-                    if not cv2.imwrite(str(folder / f"{side}-{stage}.png"), frame):
-                        raise OSError("Kunne ikke gemme kamerabilledet.")
+                    (folder / f"{side}-{stage}.png").write_bytes(encode_image(frame, "PNG"))
             metadata = {
                 "id": sample_id, "created": time(), "prediction": prediction,
                 "calibration": calibration, "cameras": cameras,

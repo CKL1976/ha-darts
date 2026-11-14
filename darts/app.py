@@ -7,16 +7,20 @@ from pathlib import Path
 from threading import Lock, Thread
 from time import monotonic, sleep
 
-import cv2
 import numpy as np
 from flask import Flask, Response, abort, render_template, request
 from waitress import serve
+from scipy import ndimage
+from skimage.feature import canny
+from skimage.transform import probabilistic_hough_line
 from scipy.interpolate import LinearNDInterpolator
 from scipy.optimize import least_squares
 
 from diagnostics import diagnostics, capture_sample
 
 from camera import SnapshotCamera
+from imaging import (decode_image, encode_image, fit_homography, grayscale,
+                     hsv_image, project_points, sample_image, valid_quad)
 from mqtt_entities import DartEntities
 
 app = Flask(__name__)
@@ -58,9 +62,7 @@ def ingress_only():
 def capture(side):
     try:
         data = cameras[side].snapshot()
-        frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
-        if frame is None:
-            raise ValueError("Kameraet returnerede et ulæseligt billede.")
+        frame = decode_image(data)
     except ValueError as exc:
         raise ValueError(f"{side}: {exc}") from exc
     return frame
@@ -92,7 +94,7 @@ def calibration_geometry(points, radius):
             board_points(range(len(sectors)), ring, -sector_angle / 2)
             for ring in mesh_radii
         ])).astype(np.float32)
-    if not cv2.isContourConvex(source[:4]) or cv2.contourArea(source[:4]) < 100:
+    if not valid_quad(source[:4]):
         raise ValueError("De fire punkter på dobbeltringen ligger forkert.")
     indices = [sectors.index(sector) for sector in anchor_sectors]
     target = board_points(indices, radius, -sector_angle / 2)
@@ -105,9 +107,9 @@ def calibration_geometry(points, radius):
 def transform(points, radius=double_outer):
     source, target = calibration_geometry(points, radius)
     if len(source) == 4:
-        return cv2.getPerspectiveTransform(source, target)
+        return fit_homography(source, target)
     # Fit in pixel space, where the manual clicks introduce measurement error.
-    inverse, _ = cv2.findHomography(target, source, method=0)
+    inverse = fit_homography(target, source)
     if inverse is None or not np.isfinite(inverse).all():
         raise ValueError("Kunne ikke tilpasse kalibreringen.")
     forward = np.linalg.inv(inverse)
@@ -121,14 +123,14 @@ class CalibrationMesh:
         # Add intermediate points along each curved ring. Interpolate the
         # correction to the perspective projection around the ring, so the
         # outer double stays curved and inside the calibrated region.
-        base = cv2.perspectiveTransform(target[None], inverse)[0]
+        base = project_points(target[None], inverse)[0]
         corrections = (source - base)[1:].reshape(len(mesh_radii), len(sectors), 2)
         extra_targets, extra_sources = [], []
         indices = np.arange(len(sectors))
         for ring, radius in enumerate(mesh_radii):
             for fraction in (.25, .5, .75):
                 points = board_points(indices + fraction, radius, -sector_angle / 2)
-                projected = cv2.perspectiveTransform(points[None], inverse)[0]
+                projected = project_points(points[None], inverse)[0]
                 correction = corrections[ring]
                 extra_targets.extend(points)
                 extra_sources.extend(projected + (1 - fraction) * correction
@@ -136,7 +138,7 @@ class CalibrationMesh:
         # Extend the mesh beyond the scoring wire so points in the black
         # surround use the same local coordinate system when scored as OUT.
         outer = board_points(np.arange(0, len(sectors), .25), 190, -sector_angle / 2)
-        projected = cv2.perspectiveTransform(outer[None], inverse)[0]
+        projected = project_points(outer[None], inverse)[0]
         correction = corrections[-1]
         phase = np.arange(len(outer)) / 4
         index = phase.astype(int)
@@ -167,7 +169,7 @@ class CalibrationMesh:
         result = interpolate(points)
         outside = ~np.isfinite(result).all(axis=-1)
         if outside.any():
-            result[outside] = cv2.perspectiveTransform(
+            result[outside] = project_points(
                 points[outside].reshape(1, -1, 2), self.fallback[backwards]
             )[0]
         return result.astype(np.float32)
@@ -177,7 +179,7 @@ def project(points, mapping, backwards=False):
     if isinstance(mapping, CalibrationMesh):
         return mapping.project(points, backwards)
     matrix = np.linalg.inv(mapping) if backwards else mapping
-    return cv2.perspectiveTransform(points, matrix)
+    return project_points(points, matrix)
 
 
 def field_at(x, y):
@@ -199,14 +201,14 @@ def field_at(x, y):
 def axes(mask, mapping):
     # In both mounted camera views the flight is above the tip. Use the
     # silhouette's width along each near-vertical edge to find the taper.
-    edges = cv2.Canny(mask, 40, 100)
+    edges = canny(mask, low_threshold=40, high_threshold=100)
     scale = mask.shape[0] / 1536
-    segments = cv2.HoughLinesP(edges, 1, np.pi / 180, 24,
-                               minLineLength=max(18, round(40 * scale)),
-                               maxLineGap=max(5, round(12 * scale)))
-    if segments is None:
+    segments = probabilistic_hough_line(edges, threshold=24,
+                                       line_length=max(18, round(40 * scale)),
+                                       line_gap=max(5, round(12 * scale)), rng=0)
+    if not segments:
         return []
-    segments = segments.reshape(-1, 2, 2)
+    segments = np.asarray(segments)
     lengths = np.linalg.norm(segments[:, 1] - segments[:, 0], axis=1)
     result = []
     along = np.arange(-75, 125, 2, dtype=np.float32) * scale
@@ -218,8 +220,7 @@ def axes(mask, mapping):
             continue
         normal = np.array([direction[1], -direction[0]])
         grid = bottom + along[:, None, None] * direction + across[None, :, None] * normal
-        profile = cv2.remap(mask, grid[:, :, 0].astype(np.float32),
-                            grid[:, :, 1].astype(np.float32), cv2.INTER_NEAREST) > 0
+        profile = sample_image(mask, grid, order=0) > 0
         # A barrel has support on several adjacent cross-sections. The
         # support narrows at the point and disappears beyond the board entry.
         width = profile.sum(axis=1)
@@ -270,9 +271,8 @@ def detect(masks, transforms, diagnostics=None):
 def change_mask(previous, current):
     if previous.shape != current.shape:
         raise ValueError("Kameraets billedstørrelse har ændret sig.")
-    delta = cv2.absdiff(cv2.cvtColor(previous, cv2.COLOR_BGR2GRAY),
-                        cv2.cvtColor(current, cv2.COLOR_BGR2GRAY))
-    return cv2.threshold(delta, 30, 255, cv2.THRESH_BINARY)[1]
+    delta = np.abs(grayscale(previous).astype(np.int16) - grayscale(current))
+    return (delta > 30).astype(np.uint8) * 255
 
 
 def detect_throw(before, after, mappings):
@@ -282,7 +282,7 @@ def detect_throw(before, after, mappings):
     hit = detect(masks, mappings, diagnostics)
     try:
         capture_sample(before, after, hit, json.loads(calibration_path.read_text()), camera_selection())
-    except (OSError, ValueError, cv2.error):
+    except (OSError, ValueError):
         app.logger.exception("Kunne ikke gemme detektionsbilleder")
     if hit is not None:
         return hit
@@ -316,7 +316,7 @@ def capture_diagnostic_pair():
             sample_id = capture_sample(before, frames, None, calibration, selection, manual=True)
             diagnostic_before = None
             return {"id": sample_id}
-        except (OSError, ValueError, cv2.error) as exc:
+        except (OSError, ValueError) as exc:
             return {"error": str(exc)}, 400
 
 
@@ -358,9 +358,8 @@ def select_cameras():
         def check_camera(role):
             try:
                 raw = proposed[role].snapshot()
-                if cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR) is None:
-                    raise ValueError("Adressen returnerede ikke et stillbillede.")
-            except (ValueError, cv2.error) as exc:
+                decode_image(raw)
+            except ValueError as exc:
                 name = "Venstre kamera" if role == "left" else "Højre kamera"
                 raise ValueError(f"{name}: {exc}") from exc
 
@@ -403,16 +402,10 @@ def camera_image(side):
     try:
         image = camera.snapshot(preview=True)
         if not image.startswith(b"\xff\xd8"):
-            frame = cv2.imdecode(np.frombuffer(image, np.uint8), cv2.IMREAD_COLOR)
-            if frame is None:
-                raise ValueError("Kameraet returnerede et ulæseligt billede.")
-            ok, jpeg = cv2.imencode(".jpg", frame)
-            if not ok:
-                raise ValueError("Kunne ikke vise kamerabilledet.")
-            image = jpeg.tobytes()
+            image = encode_image(decode_image(image), "JPEG")
         return Response(image, mimetype="image/jpeg",
                         headers={"Cache-Control": "no-store"})
-    except (OSError, ValueError, cv2.error) as exc:
+    except (OSError, ValueError) as exc:
         return str(exc), 502
 
 
@@ -433,11 +426,10 @@ def board_is_clear(frames, baseline_frames):
     for baseline, frame in zip(baseline_frames, frames):
         if baseline.shape != frame.shape:
             raise ValueError("Kameraets billedstørrelse har ændret sig.")
-        delta = cv2.cvtColor(cv2.absdiff(baseline, frame), cv2.COLOR_BGR2GRAY)
-        mask = cv2.threshold(delta, 30, 255, cv2.THRESH_BINARY)[1]
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-        _, _, stats, _ = cv2.connectedComponentsWithStats(mask)
-        if np.any(stats[1:, cv2.CC_STAT_AREA] >= 100):
+        delta = grayscale(np.abs(baseline.astype(np.int16) - frame))
+        mask = ndimage.binary_opening(delta > 30, structure=np.ones((3, 3)))
+        labels, _ = ndimage.label(mask, structure=np.ones((3, 3)))
+        if np.any(np.bincount(labels.ravel())[1:] >= 100):
             return False
     return True
 
@@ -494,11 +486,11 @@ def refine_empty_board(frames):
             if isinstance(baseline, CalibrationMesh):
                 continue
             proposal = refine_calibration(frame, baseline)
-            raw = cv2.perspectiveTransform(probes, np.linalg.inv(baseline))
-            updated = cv2.perspectiveTransform(raw, proposal)
+            raw = project_points(probes, np.linalg.inv(baseline))
+            updated = project_points(raw, proposal)
             if np.max(np.linalg.norm(updated - probes, axis=2)) <= 1:
                 mappings[index] = proposal
-        except (ValueError, cv2.error, np.linalg.LinAlgError):
+        except (ValueError, np.linalg.LinAlgError):
             continue
 
 
@@ -557,7 +549,7 @@ def watch_board():
                     prepare_board(capture_pair(), points)
                 else:
                     analyze_frames(capture_pair())
-            except (OSError, ValueError, KeyError, cv2.error, np.linalg.LinAlgError) as exc:
+            except (OSError, ValueError, KeyError, np.linalg.LinAlgError) as exc:
                 pending = None
                 startup_frames = None
                 clear_frames = 0
@@ -572,7 +564,7 @@ def state():
 
 def refine_calibration(frame, initial):
     # Sample in the original pixels at half-millimeter intervals.
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    hsv = hsv_image(frame)
     hue, saturation, value = hsv.transpose(2, 0, 1)
     colored = (((hue <= 12) | (hue >= 168) | ((hue >= 36) & (hue <= 95)))
                & (value >= 45))
@@ -586,8 +578,7 @@ def refine_calibration(frame, initial):
                          (treble_inner, 1), (treble_outer, -1)):
         polar = directions[:, None, :] * (radius + offsets[None, :, None])
         xy = project(polar.astype(np.float32).reshape(1, -1, 2), initial, backwards=True).reshape(polar.shape)
-        signal = cv2.remap(chroma, xy[:, :, 0].copy(), xy[:, :, 1].copy(),
-                           cv2.INTER_LINEAR)
+        signal = sample_image(chroma, xy, order=1)
         # Compare averaged samples on each side of the expected transition.
         gradient = (signal[:, 4:] + signal[:, 3:-1]
                     - signal[:, 1:-3] - signal[:, :-4]) * (.5 * sign)
@@ -602,12 +593,12 @@ def refine_calibration(frame, initial):
 
     observed = np.float32(observed)
     targets = np.float32(targets)
-    fitted, inliers = cv2.findHomography(observed, targets, cv2.RANSAC, 1.5)
+    fitted, inliers = fit_homography(observed, targets, robust=True)
     if fitted is None or inliers.mean() < .55:
         raise ValueError("Ringkanterne stemmer ikke nok overens. Prøv manuel kalibrering.")
 
     def error(mapping):
-        predicted = cv2.perspectiveTransform(observed[None], mapping)[0]
+        predicted = project_points(observed[None], mapping)[0]
         # Evaluate both fits against the same samples from every ring and quadrant.
         return np.mean(np.minimum(np.linalg.norm(predicted - targets, axis=1), 4))
 
@@ -621,8 +612,7 @@ def wire_profiles(gray, mapping, points, normals, spoke_start):
     offsets = np.arange(-4, 4.25, .25, dtype=np.float32)
     probes = points[:, None, :] + offsets[None, :, None] * normals[:, None, :]
     pixels = project(probes.reshape(1, -1, 2), mapping, backwards=True).reshape(probes.shape)
-    signal = cv2.remap(gray, pixels[:, :, 0].copy(), pixels[:, :, 1].copy(),
-                       cv2.INTER_LINEAR)
+    signal = sample_image(gray, pixels, order=1)
     center = signal[:, 4:-4]
     left = center - signal[:, :-8]
     right = center - signal[:, 8:]
@@ -649,7 +639,7 @@ def fit_wire_offsets(points, normals, shifts, spread):
 
     def shifted(samples, parameters):
         matrix = np.eye(3) + np.r_[parameters, 0].reshape(3, 3)
-        return cv2.perspectiveTransform(
+        return project_points(
             (samples / double_outer)[None], matrix
         )[0] * double_outer
 
@@ -664,7 +654,7 @@ def fit_wire_offsets(points, normals, shifts, spread):
 def align_ring_bands(frame, initial, directions, target):
     # Locate both edges of each scoring band together before looking for
     # the thin wire. The paired edges distinguish the ring from board texture.
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    hsv = hsv_image(frame)
     hue, saturation, value = hsv.transpose(2, 0, 1)
     colored = ((hue <= 12) | (hue >= 168) | ((hue >= 36) & (hue <= 95))) & (value >= 35)
     chroma = np.where(colored, saturation, 0).astype(np.float32)
@@ -675,8 +665,7 @@ def align_ring_bands(frame, initial, directions, target):
         for radius in (inner, outer):
             probes = directions[:, None, :] * (radius + offsets[None, :, None])
             pixels = project(probes.reshape(1, -1, 2), initial, backwards=True).reshape(probes.shape)
-            signal = cv2.remap(chroma, pixels[:, :, 0].copy(), pixels[:, :, 1].copy(),
-                               cv2.INTER_LINEAR)
+            signal = sample_image(chroma, pixels, order=1)
             profiles.append(signal[:, 4:] - signal[:, :-4])
         strength = np.minimum(profiles[0], -profiles[1])
         peaks = (strength - .7 * np.abs(offsets[2:-2])).argmax(axis=1)
@@ -692,12 +681,12 @@ def align_ring_bands(frame, initial, directions, target):
     anchors = project(adjust(target).astype(np.float32)[None], initial, backwards=True)[0]
     try:
         return transform(anchors)
-    except (ValueError, cv2.error, np.linalg.LinAlgError):
+    except (ValueError, np.linalg.LinAlgError):
         return initial
 
 
 def fit_steel_wires(frame, initial):
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    gray = grayscale(frame).astype(np.float32)
     ring_directions = board_points(
         np.arange(len(sectors)).repeat(5) + np.tile([.2, .35, .5, .65, .8], len(sectors)),
         1, -sector_angle / 2,
@@ -772,18 +761,16 @@ def auto_calibrate():
             initial = transform(saved[side], radius)
             try:
                 proposal[side] = fit_steel_wires(frame, initial)
-            except (ValueError, cv2.error, np.linalg.LinAlgError) as exc:
+            except (ValueError, np.linalg.LinAlgError) as exc:
                 name = {"left": "Venstre kamera", "right": "Højre kamera"}[side]
                 warnings[side] = f"{name}: {exc}"
                 continue
-            ok, jpeg = cv2.imencode(".jpg", frame)
-            if not ok:
-                raise ValueError("Kunne ikke vise kalibreringsbilledet.")
-            images[side] = base64.b64encode(jpeg.tobytes()).decode("ascii")
+            jpeg = encode_image(frame, "JPEG")
+            images[side] = base64.b64encode(jpeg).decode("ascii")
         if warnings:
             return {"error": " ".join(warnings.values())}, 422
         return {"points": proposal, "images": images}
-    except (OSError, ValueError, KeyError, TypeError, cv2.error, np.linalg.LinAlgError) as exc:
+    except (OSError, ValueError, KeyError, TypeError, np.linalg.LinAlgError) as exc:
         return {"error": str(exc)}, 400
 
 
@@ -813,7 +800,7 @@ def calibration_preview():
             labels[side] = project(number_positions[None], mapping, backwards=True)[0].tolist()
         return {**overlay, "errors": errors, "numbers": sectors,
                 "labels": labels}
-    except (KeyError, TypeError, ValueError, cv2.error, np.linalg.LinAlgError) as exc:
+    except (KeyError, TypeError, ValueError, np.linalg.LinAlgError) as exc:
         return {"error": str(exc)}, 400
 
 
@@ -852,7 +839,7 @@ def act(action):
                 status = "Klar. Kast en pil."
             else:
                 abort(404)
-        except (OSError, ValueError, KeyError, TypeError, cv2.error, np.linalg.LinAlgError) as exc:
+        except (OSError, ValueError, KeyError, TypeError, np.linalg.LinAlgError) as exc:
             return {"error": str(exc)}, 400
         pending = None
         clear_frames = 0
