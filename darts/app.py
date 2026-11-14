@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from itertools import combinations
 from pathlib import Path
 from threading import Lock, Thread
-from time import sleep
+from time import monotonic, sleep
 
 import cv2
 import numpy as np
@@ -29,6 +29,8 @@ anchor_sectors = (20, 6, 3, 11)
 reference = None
 empty_board = None
 mappings = None
+manual_mappings = None
+next_refinement = 0
 pending = None
 clear_frames = 0
 status = "Start med tom skive."
@@ -205,13 +207,61 @@ def detect(masks, transforms, diagnostics=None, before=None):
             "x_mm": round(float(hit[0]), 1), "y_mm": round(float(hit[1]), 1)}
 
 
-def detect_throw(before, after, mappings, board):
+def center_hit(mask, mapping):
+    # Center Cam is mounted so the tip appears below the barrel.
+    clean = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    contours, _ = cv2.findContours(clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        return None
+    contour = max(contours, key=cv2.contourArea)
+    x, y, width, height = cv2.boundingRect(contour)
+    if cv2.contourArea(contour) < 80 or height < 20 or max(width, height) > .45 * max(mask.shape):
+        return None
+    pixels = contour.reshape(-1, 2)
+    bottom = pixels[pixels[:, 1] >= pixels[:, 1].max() - 2]
+    tip = np.float32([[np.median(bottom, axis=0)]])
+    hit = cv2.perspectiveTransform(tip, mapping)[0, 0]
+    field, points = field_at(*hit)
+    if field == "MISS":
+        return None
+    return {"field": field, "points": points,
+            "x_mm": round(float(hit[0]), 1), "y_mm": round(float(hit[1]), 1)}
+
+
+def validate_center(hit, masks, transforms, board):
+    position = np.float32([[[hit["x_mm"], hit["y_mm"]]]])
+    cropped_masks = []
+    for mask, mapping in zip(masks[:2], transforms[:2]):
+        x, y = np.rint(cv2.perspectiveTransform(position, np.linalg.inv(mapping))[0, 0]).astype(int)
+        crop = np.zeros_like(mask)
+        left, right = max(0, x-110), min(mask.shape[1], x+111)
+        top, bottom = max(0, y-110), min(mask.shape[0], y+111)
+        if left >= right or top >= bottom:
+            return hit
+        crop[top:bottom, left:right] = mask[top:bottom, left:right]
+        cropped_masks.append(crop)
+    verified = detect(cropped_masks, transforms[:2], before=board[:2])
+    if verified and math.hypot(hit["x_mm"] - verified["x_mm"],
+                               hit["y_mm"] - verified["y_mm"]) <= 18:
+        return verified
+    return hit
+
+
+def detect_throw(before, after, mappings, board, primary=None):
     masks = []
     for previous, current in zip(before, after):
         if previous.shape != current.shape:
             raise ValueError("Kameraets billedstørrelse har ændret sig.")
         delta = cv2.cvtColor(cv2.absdiff(previous, current), cv2.COLOR_BGR2GRAY)
         masks.append(cv2.threshold(delta, 30, 255, cv2.THRESH_BINARY)[1])
+
+    if len(masks) == 3:
+        if primary is not None:
+            return validate_center(primary, masks, mappings, board)
+        hit = center_hit(masks[2], mappings[2])
+        if hit is None:
+            raise ValueError("Venter på et træf fra Center Cam.")
+        return hit
 
     diagnostics = {}
     hit = detect(masks, mappings, diagnostics, before=board)
@@ -272,6 +322,7 @@ def analyze_frames(frames):
         clear_frames += 1
         if clear_frames >= 2:
             reference = frames
+            refine_empty_board(frames)
             if darts:
                 darts.clear()
                 if entities:
@@ -280,24 +331,54 @@ def analyze_frames(frames):
         return
 
     clear_frames = 0
+    if len(frames) == 3 and pending is not None:
+        primary = darts[-1]
+        corrected = detect_throw(pending, frames, mappings, empty_board, primary=primary)
+        darts[-1] = corrected
+        pending = None
+        if entities and corrected["points"] != primary["points"]:
+            entities.update_throw(corrected["points"], len(darts))
+        status = "Tur slut. Fjern pilene." if len(darts) == 3 else "Klar til næste pil."
+        return
     if len(darts) >= 3:
         status = "Tur slut. Fjern pilene."
         return
     hit = detect_throw(reference, frames, mappings, empty_board)
-    previous = pending
-    pending = hit
-    if previous is None or previous["field"] != hit["field"] or math.hypot(
-        previous["x_mm"] - hit["x_mm"], previous["y_mm"] - hit["y_mm"]
-    ) > 6:
-        status = f"Bekræfter {hit['field']}."
-        return
+    if len(frames) == 2:
+        previous = pending
+        pending = hit
+        if previous is None or previous["field"] != hit["field"] or math.hypot(
+            previous["x_mm"] - hit["x_mm"], previous["y_mm"] - hit["y_mm"]
+        ) > 6:
+            status = f"Bekræfter {hit['field']}."
+            return
 
     darts.append(hit)
+    pending = reference if len(frames) == 3 else None
     reference = frames
-    pending = None
-    status = "Tur slut. Fjern pilene." if len(darts) == 3 else "Klar til næste pil."
+    status = (f"Center Cam: {hit['field']}. Validerer." if pending is not None else
+              "Tur slut. Fjern pilene." if len(darts) == 3 else "Klar til næste pil.")
     if entities:
         entities.update_throw(hit["points"], len(darts))
+
+
+def refine_empty_board(frames):
+    global next_refinement
+    now = monotonic()
+    if now < next_refinement or manual_mappings is None:
+        return
+    next_refinement = now + 30
+    probes = board_points(range(len(sectors)), double_outer)[None]
+    for index, frame in enumerate(frames):
+        try:
+            baseline = manual_mappings[index]
+            proposal = refine_calibration(frame, baseline)
+            raw = cv2.perspectiveTransform(probes, np.linalg.inv(baseline))
+            updated = cv2.perspectiveTransform(raw, proposal)
+            if np.max(np.linalg.norm(updated - probes, axis=2)) <= 4:
+                mappings[index] = proposal
+        except (ValueError, cv2.error, np.linalg.LinAlgError):
+            continue
 
 
 def watch_board():
@@ -309,7 +390,7 @@ def watch_board():
                 continue
             try:
                 frames = capture_pair()
-                if all(a.shape == b.shape and np.count_nonzero(
+                if pending is None and all(a.shape == b.shape and np.count_nonzero(
                     cv2.cvtColor(cv2.absdiff(a, b), cv2.COLOR_BGR2GRAY) > 30
                 ) < 180 for a, b in zip(reference, frames)) and darts and not clear_frames:
                     pending = None
@@ -317,7 +398,8 @@ def watch_board():
                     continue
                 analyze_frames(frames)
             except (OSError, ValueError, cv2.error, np.linalg.LinAlgError) as exc:
-                pending = None
+                if len(cameras) == 2:
+                    pending = None
                 clear_frames = 0
                 status = str(exc)
 
@@ -439,7 +521,8 @@ def calibration_preview():
 
 @app.post("/action/<action>")
 def act(action):
-    global reference, empty_board, mappings, pending, clear_frames, status
+    global reference, empty_board, mappings, manual_mappings, next_refinement
+    global pending, clear_frames, status
     with lock:
         frames = None
         try:
@@ -462,7 +545,9 @@ def act(action):
                     raise ValueError("Kalibrér alle tilsluttede kameraer først.")
                 new_mappings = [transform(points[side], radius) for side in cameras]
                 frames = capture_pair()
-                mappings = new_mappings
+                manual_mappings = new_mappings
+                mappings = new_mappings.copy()
+                next_refinement = 0
                 empty_board = reference = frames
                 status = "Klar. Kast en pil."
             else:
