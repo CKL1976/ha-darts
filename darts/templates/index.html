@@ -18,7 +18,6 @@ canvas{display:block;width:100%;height:auto;cursor:crosshair;margin-bottom:14px}
 <p><strong id="score">0 point</strong> <span id="throws"></span></p>
 <div>
 <button id="reset">Start tur med tom skive</button>
-<button id="dart" disabled>Analysér ny pil</button>
 <button id="calibrate">Kalibrér</button>
 <button id="refresh">Hent billeder</button>
 </div>
@@ -38,14 +37,13 @@ canvas{display:block;width:100%;height:auto;cursor:crosshair;margin-bottom:14px}
 const get = id => document.getElementById(id);
 const sides = ["left", "right"];
 const wires = ["5/20", "13/6", "17/3", "8/11"];
-let points = null, busy = false, active = false, count = 0;
+let points = null, busy = false, lastTurn = null;
 let zoom = null;
 const cropSize = 180;
 const canvas = get("crop");
 const context = canvas.getContext("2d");
 function controls() {
   get("reset").disabled = busy || !!points;
-  get("dart").disabled = busy || !!points || !active || count === 3;
   get("refresh").disabled = busy;
   get("calibrate").disabled = busy;
   get("calibrate").textContent = points ? "Afbryd kalibrering" : "Kalibrér";
@@ -71,20 +69,42 @@ async function action(name, payload) {
   });
   const data = await response.json();
   if (!response.ok) throw Error(data.error);
-  active = name !== "calibrate";
-  count = data.darts.length;
+  drawTurn(data);
+}
+function drawTurn(data) {
   get("score").textContent = data.total + " point";
   get("throws").textContent = data.darts.map(d => d.field).join(" · ");
-  get("status").textContent = name === "calibrate" ? "Kalibrering gemt." :
-    count === 3 ? "Tur slut. Fjern pilene." : "Klar til næste pil.";
+  get("status").textContent = data.status;
 }
+async function poll() {
+  try {
+    if (!busy && !points) {
+      const response = await fetch("state", {cache: "no-store"});
+      if (!response.ok) return;
+      const data = await response.json();
+      if (busy || points) return;
+      drawTurn(data);
+      const turn = JSON.stringify(data.darts);
+      if (lastTurn !== null && turn !== lastTurn) {
+        lastTurn = turn;
+        await run(refresh);
+      } else {
+        lastTurn = turn;
+      }
+    }
+  } catch (err) {
+    if (!busy && !points) get("status").textContent = "Kunne ikke hente kaststatus.";
+  } finally {
+    setTimeout(poll, 1200);
+  }
+}
+
 function prompt() {
   const step = Math.min(points.left.length, points.right.length);
   get("status").textContent = "Kalibrér mellem " +
     wires[step] + ". Klik nær krydset på dobbeltringens inderste wire i begge billeder.";
 }
 get("reset").onclick = () => run(() => action("reset"));
-get("dart").onclick = () => run(async () => { await action("dart"); await refresh(); });
 get("refresh").onclick = () => run(refresh);
 get("calibrate").onclick = () => run(async () => {
   points = points ? null : {left:[], right:[]};
@@ -150,6 +170,6 @@ get("confirm").onclick = () => {
   } else if (points.left.length === points.right.length) prompt();
   else get("status").textContent = "Vælg og bekræft samme punkt i det andet billede.";
 };
-run(refresh);
+run(refresh).then(poll);
 </script>
 </html>

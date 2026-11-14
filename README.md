@@ -16,10 +16,10 @@ Start appen og åbn webgrænsefladen.
    dér, hvor rød/grøn møder sort/hvid. Bekræft krydset for begge kameraer.
 2. Vælg Start tur med tom skive. Ældre kalibreringer bruger stadig den
    yderste wire, indtil du gennemfører en ny kalibrering.
-3. Kast én pil, og vælg Analysér ny pil. Vent på resultatet, før du kaster igen.
-   Gentag op til tre gange. Ved usikkert resultat vises en fejl, og den
-   sidst godkendte score bevares.
-4. Fjern alle pile inden næste tur.
+3. Kast én pil, og vent på scoren, før du kaster igen. Appen analyserer
+   automatisk og tæller op til tre pile, også når webvisningen er lukket.
+4. Fjern alle pile. Appen starter næste tur, når den genkender den tomme
+   skive i begge kameraer. Efter genstart skal du starte med tom skive igen.
 
 ## MQTT-entiteter
 
@@ -39,4 +39,3 @@ Appen registrerer tre sensorer og to billedentiteter under enheden HA Darts:
 Scoren opdateres ved godkendte kast og nulstilling. Billeder sendes ved
 billedhentning, turstart og godkendte kast. Brokeren gemmer de seneste
 billeder på de to MQTT-emner, så de kan vises efter genstart af Home Assistant.
-Detektion er knapstyret.

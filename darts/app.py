@@ -2,7 +2,8 @@ import json
 import math
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Thread
+from time import sleep
 from urllib.error import HTTPError
 from urllib.request import urlopen
 
@@ -20,6 +21,11 @@ calibration_path = Path("/data/calibration.json")
 sides = ("left", "right")
 sectors = (20, 1, 18, 4, 13, 6, 10, 15, 2, 17, 3, 19, 7, 16, 8, 11, 14, 9, 12, 5)
 reference = None
+empty_board = None
+mappings = None
+pending = None
+clear_frames = 0
+status = "Start med tom skive."
 darts = []
 entities = None
 
@@ -173,7 +179,6 @@ def detect_throw(before, after, mappings):
     if hit is not None:
         return hit
 
-    app.logger.warning("Kast afvist: %s", json.dumps(diagnostics))
     reason = diagnostics["reason"]
     if "best" in diagnostics:
         message = f"Usikkert kast. Bedste bud: {diagnostics['best']['field']}."
@@ -217,9 +222,100 @@ def image(side):
         return str(exc), 502
 
 
+def turn_state():
+    return {"darts": list(darts), "total": sum(d["points"] for d in darts),
+            "status": status}
+
+
+def publish_turn(frames=None):
+    if not entities:
+        return
+    entities.update_turn(darts)
+    if frames is not None:
+        for side, frame in zip(sides, frames):
+            try:
+                entities.update_image(side, encode_image(frame))
+            except (ValueError, cv2.error):
+                app.logger.warning("Kunne ikke publicere kamerabillede fra %s", side)
+
+
+def board_is_clear(frames):
+    for baseline, frame in zip(empty_board, frames):
+        if baseline.shape != frame.shape:
+            raise ValueError("Kameraets billedstørrelse har ændret sig.")
+        delta = cv2.cvtColor(cv2.absdiff(baseline, frame), cv2.COLOR_BGR2GRAY)
+        mask = cv2.threshold(delta, 30, 255, cv2.THRESH_BINARY)[1]
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        _, _, stats, _ = cv2.connectedComponentsWithStats(mask)
+        if np.any(stats[1:, cv2.CC_STAT_AREA] >= 100):
+            return False
+    return True
+
+
+def analyze_frames(frames):
+    global reference, pending, clear_frames, status
+    if board_is_clear(frames):
+        pending = None
+        clear_frames += 1
+        if clear_frames >= 2:
+            reference = frames
+            if darts:
+                darts.clear()
+                publish_turn(frames)
+            status = "Klar. Kast en pil."
+        return
+
+    clear_frames = 0
+    if len(darts) >= 3:
+        status = "Tur slut. Fjern pilene."
+        return
+    hit = detect_throw(reference, frames, mappings)
+    previous = pending
+    pending = hit
+    if previous is None or previous["field"] != hit["field"] or math.hypot(
+        previous["x_mm"] - hit["x_mm"], previous["y_mm"] - hit["y_mm"]
+    ) > 6:
+        status = f"Bekræfter {hit['field']}."
+        return
+
+    darts.append(hit)
+    reference = frames
+    pending = None
+    status = "Tur slut. Fjern pilene." if len(darts) == 3 else "Klar til næste pil."
+    publish_turn(frames)
+
+
+def watch_board():
+    global pending, clear_frames, status
+    while True:
+        sleep(1)
+        with lock:
+            if reference is None:
+                continue
+            try:
+                frames = capture_pair()
+                if all(a.shape == b.shape and np.count_nonzero(
+                    cv2.cvtColor(cv2.absdiff(a, b), cv2.COLOR_BGR2GRAY) > 30
+                ) < 180 for a, b in zip(reference, frames)) and darts and not clear_frames:
+                    pending = None
+                    status = "Tur slut. Fjern pilene." if len(darts) == 3 else "Klar til næste pil."
+                    continue
+                analyze_frames(frames)
+            except (OSError, ValueError, cv2.error, np.linalg.LinAlgError) as exc:
+                pending = None
+                clear_frames = 0
+                status = str(exc)
+
+
+@app.get("/state")
+def state():
+    with lock:
+        return turn_state(), 200, {"Cache-Control": "no-store"}
+
+
 @app.post("/action/<action>")
 def act(action):
-    global reference
+    global reference, empty_board, mappings, pending, clear_frames, status
     with lock:
         frames = None
         try:
@@ -232,39 +328,31 @@ def act(action):
                 temp.write_text(json.dumps({**points, "ring": "inner_double"}))
                 temp.replace(calibration_path)
                 reference = None
-                darts.clear()
+                status = "Kalibrering gemt. Start med tom skive."
             elif action == "reset":
-                frames = capture_pair()
-                reference = frames
-                darts.clear()
-            elif action == "dart":
-                if reference is None or not calibration_path.exists():
-                    raise ValueError("Kalibrér kameraerne og start med tom skive.")
-                if len(darts) == 3:
-                    raise ValueError("Turen er slut. Fjern pilene og start en ny tur.")
+                if not calibration_path.exists():
+                    raise ValueError("Kalibrér kameraerne først.")
                 points = json.loads(calibration_path.read_text())
-                frames = capture_pair()
                 radius = 162 if points.get("ring") == "inner_double" else 170
-                mappings = [transform(points[side], radius) for side in sides]
-                darts.append(detect_throw(reference, frames, mappings))
-                reference = frames
+                new_mappings = [transform(points[side], radius) for side in sides]
+                frames = capture_pair()
+                mappings = new_mappings
+                empty_board = reference = frames
+                status = "Klar. Kast en pil."
             else:
                 abort(404)
         except (OSError, ValueError, KeyError, TypeError, cv2.error, np.linalg.LinAlgError) as exc:
             return {"error": str(exc)}, 400
-        if entities:
-            entities.update_turn(darts)
-            if frames is not None:
-                for side, frame in zip(sides, frames):
-                    try:
-                        entities.update_image(side, encode_image(frame))
-                    except (ValueError, cv2.error):
-                        app.logger.warning("Kunne ikke publicere kamerabillede fra %s", side)
-        return {"darts": list(darts), "total": sum(d["points"] for d in darts)}
+        pending = None
+        clear_frames = 0
+        darts.clear()
+        publish_turn(frames)
+        return turn_state()
 
 
 if __name__ == "__main__":
     options = json.loads(options_path.read_text())
     if options.get("mqtt_host"):
         entities = DartEntities(options)
+    Thread(target=watch_board, daemon=True).start()
     serve(app, host="0.0.0.0", port=8099, threads=4)
