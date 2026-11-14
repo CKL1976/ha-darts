@@ -36,6 +36,7 @@ canvas{display:block;width:100%;height:auto;cursor:crosshair;margin-bottom:14px}
 <summary>DeepDarts</summary>
 <p id="modelStatus" aria-live="polite">{{ "DeepDarts er aktiv." if deepdarts_active else "Installér DeepDarts D1 for at registrere kast." }}</p>
 <button id="downloadModel" type="button">Hent og installér DeepDarts D1</button>
+<button id="testModel" type="button">Test pilene i skiven</button>
 </details>
 <p><strong id="score">0 point</strong> <span id="throws"></span></p>
 <div>
@@ -555,6 +556,24 @@ get("saveCalibration").onclick = () => run(async () => {
   points = null;
   hideOverlay();
 });
+get("testModel").onclick = async () => {
+  const button = get("testModel");
+  const output = get("modelStatus");
+  button.disabled = true;
+  output.textContent = "Tester begge kameraer …";
+  try {
+    const response = await fetch("deepdarts/test", {method: "POST"});
+    const details = await response.json();
+    if (!response.ok) throw Error(details.error);
+    output.textContent = Object.entries(details).map(([name, result]) =>
+      name + ": venstre " + result.left + ", højre " + result.right +
+      ", fælles " + (result.hits.join(", ") || "ingen")).join(" · ");
+  } catch (error) {
+    output.textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+};
 get("downloadModel").onclick = async () => {
   const button = get("downloadModel");
   button.disabled = true;

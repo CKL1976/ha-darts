@@ -233,40 +233,89 @@ model_coordinates = (
 ) * model_mm_per_pixel
 
 
-def detect_throws(before, after, mappings):
-    model = deepdarts_model
-    if model is None:
-        raise ValueError("Installér DeepDarts D1 for at registrere kast.")
-    views, counts = [], []
-    for previous, frame, mapping in zip(before, after, mappings):
-        if previous.shape != frame.shape:
-            raise ValueError("Kameraets billedstørrelse har ændret sig.")
+def model_points(frame, mapping, *, frontal):
+    if frontal:
         coordinates = project(model_coordinates, mapping, backwards=True)
         board = np.stack([sample_image(channel, coordinates, order=1)
                           for channel in frame.transpose(2, 0, 1)], axis=-1)
-        tips = model.tips(board)
-        candidates = []
-        for tip in tips:
-            point = (tip - model_view_size / 2) * model_mm_per_pixel
-            if field_at(*point)[0] == "MISS":
-                continue
-            pixel = project(point.reshape(1, 1, 2), mapping, backwards=True)[0, 0]
-            if not np.isfinite(pixel).all():
-                continue
-            x, y = np.rint(pixel).astype(int)
-            height, width = frame.shape[:2]
-            if not (0 <= x < width and 0 <= y < height):
-                continue
-            region = np.s_[max(0, y-16):y+17, max(0, x-16):x+17]
-            delta = np.abs(previous[region].astype(np.int16) - frame[region])
-            if np.count_nonzero(delta.max(axis=2) > 25) >= 4:
-                candidates.append(point)
-        views.append(candidates)
-        counts.append(f"{len(tips)} fundet, {len(candidates)} nye")
-    hits = match_tips(views, mappings)
-    if not hits:
-        raise ValueError(f"DeepDarts fandt intet fælles træf. Venstre: {counts[0]}. Højre: {counts[1]}.")
-    return hits
+        return [(tip - model_view_size / 2) * model_mm_per_pixel
+                for tip in deepdarts_model.tips(board)]
+
+    outline = board_points(np.arange(0, len(sectors), .25), 205)
+    pixels = project(outline[None], mapping, backwards=True)[0]
+    if not np.isfinite(pixels).all():
+        return []
+    height, width = frame.shape[:2]
+    x0, y0 = np.maximum(np.floor(pixels.min(axis=0)).astype(int), 0)
+    x1, y1 = np.minimum(np.ceil(pixels.max(axis=0)).astype(int) + 1, [width, height])
+    if x1 <= x0 or y1 <= y0:
+        return []
+    return [project((tip + np.float32([x0, y0])).reshape(1, 1, 2), mapping)[0, 0]
+            for tip in deepdarts_model.tips(frame[y0:y1, x0:x1])]
+
+
+def new_model_points(points, previous, frame, mapping):
+    candidates = []
+    for point in points:
+        if not np.isfinite(point).all() or field_at(*point)[0] == "MISS":
+            continue
+        pixel = project(point.reshape(1, 1, 2), mapping, backwards=True)[0, 0]
+        if not np.isfinite(pixel).all():
+            continue
+        x, y = np.rint(pixel).astype(int)
+        height, width = frame.shape[:2]
+        if not (0 <= x < width and 0 <= y < height):
+            continue
+        region = np.s_[max(0, y-16):y+17, max(0, x-16):x+17]
+        delta = np.abs(previous[region].astype(np.int16) - frame[region])
+        if np.count_nonzero(delta.max(axis=2) > 25) >= 4:
+            candidates.append(point)
+    return candidates
+
+
+def detect_throws(before, after, mappings):
+    if deepdarts_model is None:
+        raise ValueError("Installér DeepDarts D1 for at registrere kast.")
+    if any(previous.shape != frame.shape for previous, frame in zip(before, after)):
+        raise ValueError("Kameraets billedstørrelse har ændret sig.")
+    views, counts = [[], []], [[], []]
+    for frontal in (True, False):
+        for index, (previous, frame, mapping) in enumerate(zip(before, after, mappings)):
+            points = model_points(frame, mapping, frontal=frontal)
+            candidates = new_model_points(points, previous, frame, mapping)
+            counts[index].append(f"{len(points)} fundet, {len(candidates)} nye")
+            for point in candidates:
+                if all(np.linalg.norm(point - existing) > 4 for existing in views[index]):
+                    views[index].append(point)
+        hits = match_tips(views, mappings)
+        if hits:
+            return hits
+    left, right = (" / ".join(view_counts) for view_counts in counts)
+    raise ValueError(f"DeepDarts fandt intet fælles træf. Venstre: {left}. Højre: {right}.")
+
+
+@app.post("/deepdarts/test")
+def test_deepdarts():
+    with lock:
+        try:
+            if deepdarts_model is None:
+                raise ValueError("Installér DeepDarts D1 først.")
+            saved = saved_calibration()
+            radius = double_inner if saved.get("ring") == "inner_double" else double_outer
+            transforms = [transform(saved[side], radius) for side in camera_roles]
+            frames = capture_pair()
+            results = {}
+            for name, frontal in (("Oprettet billede", True), ("Kameravinkel", False)):
+                views = [
+                    [point for point in model_points(frame, mapping, frontal=frontal)
+                     if np.isfinite(point).all() and field_at(*point)[0] != "MISS"]
+                    for frame, mapping in zip(frames, transforms)
+                ]
+                results[name] = {"left": len(views[0]), "right": len(views[1]),
+                                 "hits": [hit["field"] for hit in match_tips(views, transforms)]}
+            return results
+        except (OSError, ValueError, RuntimeError, np.linalg.LinAlgError) as exc:
+            return {"error": str(exc)}, 400
 
 
 @app.post("/deepdarts/download")
