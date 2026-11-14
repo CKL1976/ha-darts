@@ -4,14 +4,13 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Lock, Thread
 from time import sleep
-from urllib.error import HTTPError
-from urllib.request import urlopen
 
 import cv2
 import numpy as np
 from flask import Flask, Response, abort, render_template, request
 from waitress import serve
 
+from camera import CameraFeed
 from mqtt_entities import DartEntities
 
 app = Flask(__name__)
@@ -28,6 +27,8 @@ clear_frames = 0
 status = "Start med tom skive."
 darts = []
 entities = None
+cameras = {}
+last_capture = {}
 
 
 @app.before_request
@@ -37,21 +38,14 @@ def ingress_only():
 
 
 def capture(side):
-    options = json.loads(options_path.read_text())
-    for attempt in range(2):
-        try:
-            with urlopen(options[f"{side}_url"], timeout=5) as response:
-                data = response.read(8_000_001)
-            break
-        except HTTPError as exc:
-            exc.close()
-            if exc.code != 404 or attempt == 1:
-                raise ValueError(f"{side}: Kameraet svarede HTTP {exc.code}.") from exc
-    if len(data) > 8_000_000:
-        raise ValueError(f"{side}: Camera response exceeds 8 MB")
-    frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
-    if frame is None:
-        raise ValueError(f"{side}: Camera did not return an image")
+    try:
+        data, timestamp = cameras[side].latest(last_capture.get(side, 0))
+        frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+        if frame is None:
+            raise ValueError("Kameraet returnerede et ulæseligt billede.")
+    except ValueError as exc:
+        raise ValueError(f"{side}: {exc}") from exc
+    last_capture[side] = timestamp
     return frame
 
 
@@ -212,21 +206,12 @@ def index():
     return render_template("index.html")
 
 
-def encode_image(frame):
-    success, jpeg = cv2.imencode(".jpg", frame)
-    if not success:
-        raise ValueError("Kunne ikke kode kamerabilledet.")
-    return jpeg.tobytes()
-
-
 @app.get("/image/<side>")
 def image(side):
     if side not in sides:
         abort(404)
     try:
-        with lock:
-            frame = capture(side)
-            jpeg = encode_image(frame)
+        jpeg, _ = cameras[side].latest()
         return Response(jpeg, mimetype="image/jpeg",
                         headers={"Cache-Control": "no-store"})
     except (OSError, ValueError, cv2.error) as exc:
@@ -378,6 +363,8 @@ def act(action):
 
 if __name__ == "__main__":
     options = json.loads(options_path.read_text())
+    cameras = {side: CameraFeed(options.get(f"{side}_live_url") or options[f"{side}_url"])
+               for side in sides}
     if options.get("mqtt_host"):
         entities = DartEntities(options)
     Thread(target=watch_board, daemon=True).start()

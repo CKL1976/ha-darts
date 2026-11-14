@@ -31,3 +31,11 @@ Den eneste MQTT-entitet er `sensor.ha_darts_seneste_kast`. Den viser
 point for den senest godkendte pil, fx 60 for T20. Tidligere HA Darts-entiteter
 fjernes via MQTT Discovery, når appen forbinder til samme broker og prefix.
 MQTT-emnet er `ha_darts/sensor/seneste_kast`.
+
+## Livekameraer
+
+Appen holder en HTTP MJPEG-forbindelse åben pr. kamera og genbruger det
+seneste billede til visning og detektion. Et almindeligt JPEG-endpoint
+hentes løbende. Hvis kameraets MJPEG-feed bruger en anden sti end /picture,
+angiv den i `left_live_url` og `right_live_url`. Kalibrering fryser billederne,
+så krydsene kan markeres på samme billedpar.

@@ -54,7 +54,7 @@ for (const [index, label] of labels.entries()) {
   get("editPoint").add(new Option(label, index));
 }
 let editing = null;
-let points = null, busy = false, lastTurn = null;
+let points = null, busy = false;
 let zoom = null;
 let overlayReady = false;
 const cropSize = 180;
@@ -107,13 +107,7 @@ async function poll() {
       const data = await response.json();
       if (busy || points) return;
       drawTurn(data);
-      const turn = JSON.stringify(data.darts);
-      if (lastTurn !== null && turn !== lastTurn) {
-        lastTurn = turn;
-        await run(refresh);
-      } else {
-        lastTurn = turn;
-      }
+      await run(refresh);
     }
   } catch (err) {
     if (!busy && !points) get("status").textContent = "Kunne ikke hente kaststatus.";
