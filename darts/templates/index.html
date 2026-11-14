@@ -34,7 +34,8 @@ canvas{display:block;width:100%;height:auto;cursor:crosshair;margin-bottom:14px}
 </details>
 <details>
 <summary>DeepDarts</summary>
-<p id="modelStatus" aria-live="polite">{{ "DeepDarts er aktiv." if deepdarts_active else "Tilføj en DeepDarts TFLite-model for at aktivere den." }}</p>
+<p id="modelStatus" aria-live="polite">{{ "DeepDarts er aktiv." if deepdarts_active else "Installér DeepDarts D1 for at registrere kast." }}</p>
+<button id="downloadModel" type="button">Hent og installér DeepDarts D1</button>
 <form id="modelForm">
   <label>Modelfil <input type="file" name="model" accept=".tflite" required></label>
   <button>Gem model</button>
@@ -558,22 +559,31 @@ get("saveCalibration").onclick = () => run(async () => {
   points = null;
   hideOverlay();
 });
-get("modelForm").onsubmit = async event => {
-  event.preventDefault();
-  const form = event.currentTarget;
-  const button = form.querySelector("button");
-  button.disabled = true;
-  get("modelStatus").textContent = "Tester modellen …";
+async function installModel(path, body, progress) {
+  const buttons = [get("downloadModel"), get("modelForm").querySelector("button")];
+  for (const button of buttons) button.disabled = true;
+  get("modelStatus").textContent = progress;
   try {
-    const response = await fetch("deepdarts/model", {method: "POST", body: new FormData(form)});
-    const result = await response.json();
-    if (!response.ok) throw Error(result.error);
+    const response = await fetch(path, {method: "POST", body});
+    const result = await response.json().catch(() => null);
+    if (response.status === 413) {
+      throw Error("Uploaden er for stor. Brug Hent og installér DeepDarts D1.");
+    }
+    if (!response.ok || !result?.active) {
+      throw Error(result?.error ?? "Installationen mislykkedes (" + response.status + ").");
+    }
     get("modelStatus").textContent = "DeepDarts er aktiv.";
   } catch (error) {
     get("modelStatus").textContent = error.message;
   } finally {
-    button.disabled = false;
+    for (const button of buttons) button.disabled = false;
   }
+}
+get("downloadModel").onclick = () => installModel(
+  "deepdarts/download", undefined, "Henter og tester DeepDarts D1 …");
+get("modelForm").onsubmit = event => {
+  event.preventDefault();
+  installModel("deepdarts/model", new FormData(event.currentTarget), "Tester modellen …");
 };
 drawBoard([]);
 controls();

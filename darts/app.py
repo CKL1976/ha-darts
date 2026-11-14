@@ -16,7 +16,7 @@ from scipy.optimize import least_squares
 
 
 from camera import SnapshotCamera
-from deepdarts import DeepDarts, MAX_MODEL_BYTES
+from deepdarts import DeepDarts, MAX_MODEL_BYTES, download_d1
 from imaging import (decode_image, encode_image, fit_homography, grayscale,
                      hsv_image, project_points, sample_image, valid_quad)
 from mqtt_entities import DartEntities
@@ -249,7 +249,6 @@ def detect_throw(before, after, mappings):
 
 @app.post("/deepdarts/model")
 def install_deepdarts():
-    global deepdarts_model
     request.max_content_length = MAX_MODEL_BYTES + 64 * 1024
     upload = request.files.get("model")
     if upload is None:
@@ -257,6 +256,20 @@ def install_deepdarts():
     weights = upload.stream.read(MAX_MODEL_BYTES + 1)
     if len(weights) > MAX_MODEL_BYTES or weights[4:8] != b"TFL3":
         return {"error": "Vælg en gyldig TFLite-fil på højst 64 MB."}, 400
+    return activate_model(weights)
+
+
+@app.post("/deepdarts/download")
+def install_default_deepdarts():
+    try:
+        weights = download_d1()
+    except (OSError, ValueError) as exc:
+        return {"error": f"Kunne ikke hente DeepDarts D1: {exc}"}, 502
+    return activate_model(weights)
+
+
+def activate_model(weights):
+    global deepdarts_model
     try:
         model = DeepDarts(weights)
         model.tips(np.zeros((800, 800, 3), dtype=np.uint8))

@@ -1,9 +1,24 @@
 """DeepDarts dart-tip inference using the Dart-Vision float32 LiteRT export."""
+from hashlib import sha256
+from urllib.request import urlopen
+
 import numpy as np
 from PIL import Image
 from scipy.special import expit
 
 MAX_MODEL_BYTES = 64 * 1024 * 1024
+
+D1_URL = ("https://raw.githubusercontent.com/iambhabha/Dart-Vision/master/"
+          "deepdarts_models/deepdarts_d1.tflite")
+D1_SHA256 = "8bcaa21b54b053649a4b93929a5e97426e8d4f2eeeee3d749ef77a856df91a3b"
+
+
+def download_d1():
+    with urlopen(D1_URL, timeout=20) as response:
+        weights = response.read(MAX_MODEL_BYTES + 1)
+    if sha256(weights).hexdigest() != D1_SHA256:
+        raise ValueError("Den hentede fil matcher ikke den verificerede model.")
+    return weights
 
 
 class DeepDarts:
