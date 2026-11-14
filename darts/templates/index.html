@@ -33,6 +33,14 @@ canvas{display:block;width:100%;height:auto;cursor:crosshair;margin-bottom:14px}
   <output id="cameraStatus" aria-live="polite"></output>
 </form>
 </details>
+<details>
+<summary>DeepDarts</summary>
+<p id="modelStatus" aria-live="polite">{{ "DeepDarts er aktiv." if deepdarts_active else "Tilføj en DeepDarts TFLite-model for at aktivere den." }}</p>
+<form id="modelForm">
+  <label>Modelfil <input type="file" name="model" accept=".tflite" required></label>
+  <button>Gem model</button>
+</form>
+</details>
 <p><strong id="score">0 point</strong> <span id="throws"></span></p>
 <div>
 <button id="reset">Nulstil med tom skive</button>
@@ -236,14 +244,16 @@ function drawCameraHits(data) {
       const [x, y] = hit.tip;
       pen.lineCap = "round";
       pen.beginPath();
-      pen.moveTo(...hit.start);
-      pen.lineTo(x, y);
-      pen.strokeStyle = "#101716";
-      pen.lineWidth = 5 * scale;
-      pen.stroke();
-      pen.strokeStyle = "#ffdc53";
-      pen.lineWidth = 2 * scale;
-      pen.stroke();
+      if (hit.start) {
+        pen.moveTo(...hit.start);
+        pen.lineTo(x, y);
+        pen.strokeStyle = "#101716";
+        pen.lineWidth = 5 * scale;
+        pen.stroke();
+        pen.strokeStyle = "#ffdc53";
+        pen.lineWidth = 2 * scale;
+        pen.stroke();
+      }
       pen.strokeStyle = pen.fillStyle = "#50e6ff";
       pen.beginPath();
       pen.arc(x, y, 8 * scale, 0, 2 * Math.PI);
@@ -561,6 +571,23 @@ get("saveCalibration").onclick = () => run(async () => {
   points = null;
   hideOverlay();
 });
+get("modelForm").onsubmit = async event => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const button = form.querySelector("button");
+  button.disabled = true;
+  get("modelStatus").textContent = "Tester modellen …";
+  try {
+    const response = await fetch("deepdarts/model", {method: "POST", body: new FormData(form)});
+    const result = await response.json();
+    if (!response.ok) throw Error(result.error);
+    get("modelStatus").textContent = "DeepDarts er aktiv.";
+  } catch (error) {
+    get("modelStatus").textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+};
 drawBoard([]);
 controls();
 if (configured) run(refresh).then(poll);

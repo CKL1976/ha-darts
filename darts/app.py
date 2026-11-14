@@ -19,6 +19,7 @@ from scipy.optimize import least_squares
 from diagnostics import diagnostics, capture_sample
 
 from camera import SnapshotCamera
+from deepdarts import DeepDarts, MAX_MODEL_BYTES
 from imaging import (decode_image, encode_image, fit_homography, grayscale,
                      hsv_image, project_points, sample_image, valid_quad)
 from mqtt_entities import DartEntities
@@ -29,6 +30,8 @@ lock = Lock()
 options_path = Path("/data/options.json")
 calibration_path = Path("/data/calibration.json")
 camera_path = Path("/data/cameras.json")
+model_path = Path("/data/deepdarts.tflite")
+deepdarts_model = None
 empty_path = Path("/data/empty-board.npz")
 camera_roles = ("left", "right")
 sectors = (20, 1, 18, 4, 13, 6, 10, 15, 2, 17, 3, 19, 7, 16, 8, 11, 14, 9, 12, 5)
@@ -248,6 +251,10 @@ def detect(masks, transforms, diagnostics=None):
     views = [axes(mask, mapping) for mask, mapping in zip(masks, transforms)]
     if diagnostics is not None:
         diagnostics["tip_counts"] = [len(view) for view in views]
+    return match_tips(views, transforms)
+
+
+def match_tips(views, transforms):
     if not all(views):
         return None
     left, right = views
@@ -262,7 +269,8 @@ def detect(masks, transforms, diagnostics=None):
     lines_by_view = []
     for mapping, (_, start) in zip(transforms, (left[left_index], right[right_index])):
         pixel = project(hit.reshape(1, 1, 2), mapping, backwards=True)[0, 0]
-        lines_by_view.append({"start": start.tolist(), "tip": pixel.tolist()})
+        lines_by_view.append({"start": start.tolist() if start is not None else None,
+                              "tip": pixel.tolist()})
     return {"field": field, "points": points,
             "x_mm": round(float(hit[0]), 1), "y_mm": round(float(hit[1]), 1),
             "camera_lines": lines_by_view}
@@ -279,7 +287,27 @@ def detect_throw(before, after, mappings):
     masks = [change_mask(previous, current)
              for previous, current in zip(before, after)]
     diagnostics = {}
-    hit = detect(masks, mappings, diagnostics)
+    hit = None
+    if deepdarts_model is not None:
+        try:
+            views = []
+            for frame, mask, mapping in zip(after, masks, mappings):
+                candidates = []
+                for tip in deepdarts_model.tips(frame):
+                    x, y = np.rint(tip).astype(int)
+                    if not mask[max(y-8, 0):y+9, max(x-8, 0):x+9].any():
+                        continue
+                    point = project(tip.reshape(1, 1, 2), mapping)[0, 0]
+                    if np.isfinite(point).all() and field_at(*point)[0] != "MISS":
+                        candidates.append((point, None))
+                views.append(candidates)
+            hit = match_tips(views, mappings)
+            if hit is not None:
+                hit["detector"] = "deepdarts"
+        except RuntimeError:
+            app.logger.exception("DeepDarts kunne ikke analysere kastet")
+    if hit is None:
+        hit = detect(masks, mappings, diagnostics)
     try:
         capture_sample(before, after, hit, json.loads(calibration_path.read_text()), camera_selection())
     except (OSError, ValueError):
@@ -288,6 +316,29 @@ def detect_throw(before, after, mappings):
         return hit
     counts = "/".join(map(str, diagnostics["tip_counts"]))
     raise ValueError(f"Fandt ingen pilespidser, der stemmer overens. Kandidater pr. kamera: {counts}.")
+
+
+@app.post("/deepdarts/model")
+def install_deepdarts():
+    global deepdarts_model
+    request.max_content_length = MAX_MODEL_BYTES + 64 * 1024
+    upload = request.files.get("model")
+    if upload is None:
+        return {"error": "Vælg en TFLite-modelfil."}, 400
+    weights = upload.stream.read(MAX_MODEL_BYTES + 1)
+    if len(weights) > MAX_MODEL_BYTES or weights[4:8] != b"TFL3":
+        return {"error": "Vælg en gyldig TFLite-fil på højst 64 MB."}, 400
+    try:
+        model = DeepDarts(weights)
+        model.tips(np.zeros((800, 800, 3), dtype=np.uint8))
+        with lock:
+            temporary = model_path.with_suffix(".tmp")
+            temporary.write_bytes(weights)
+            temporary.replace(model_path)
+            deepdarts_model = model
+    except (ImportError, OSError, RuntimeError, ValueError) as exc:
+        return {"error": f"Modellen kunne ikke indlæses: {exc}"}, 400
+    return {"active": True}
 
 
 @app.post("/samples/capture")
@@ -385,7 +436,7 @@ def select_cameras():
 @app.get("/")
 def index():
     return render_template(
-        "index.html", configured=bool(cameras), selection=camera_selection(),
+        "index.html", deepdarts_active=deepdarts_model is not None, configured=bool(cameras), selection=camera_selection(),
         camera_urls={role: camera.url for role, camera in cameras.items()},
         board={"sectors": sectors, "bull_inner": bull_inner, "bull_outer": bull_outer,
                "treble_inner": treble_inner, "treble_outer": treble_outer,
@@ -860,5 +911,10 @@ if __name__ == "__main__":
             status = "Indtast snapshotadresserne under Kameraer."
     if options.get("mqtt_host"):
         entities = DartEntities(options)
+    if model_path.exists():
+        try:
+            deepdarts_model = DeepDarts(model_path.read_bytes())
+        except (ImportError, OSError, RuntimeError, ValueError):
+            app.logger.exception("Kunne ikke starte DeepDarts")
     Thread(target=watch_board, daemon=True).start()
     serve(app, host="0.0.0.0", port=8099, threads=4)

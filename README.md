@@ -71,3 +71,15 @@ Ved bull forlænges sektorlinjen visuelt til ringkanten. Appen bruger
 punkterne til lokale korrektioner. Kontrollér overlejringen og ret de
 ønskede punkter, før du gemmer. Automatisk finjustering anvendes kun
 på den ældre kalibrering med fire eller ni punkter.
+
+## DeepDarts
+
+Åbn **DeepDarts** i appen og upload en float32 TFLite-model med
+800 × 800 RGB-input og to YOLO-udgange. Appen understøtter det
+[TFLite-format, Dart-Vision beskriver](https://github.com/iambhabha/Dart-Vision#input--output-specification).
+Modelfilen skal skaffes separat. Se [DeepDarts-artiklen](https://arxiv.org/abs/2105.09880)
+og [forskernes kode og modelhenvisninger](https://github.com/wmcnally/deep-darts).
+
+Appen bruger modellen til at finde spidser i begge kamerabilleder og
+beregner scoren ud fra den gemte kamerakalibrering. Den almindelige
+detektor tager over, når DeepDarts ikke finder et match mellem kameraerne.
