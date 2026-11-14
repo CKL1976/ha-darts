@@ -45,3 +45,11 @@ så krydsene kan markeres på samme billedpar.
 Ved et træf tæt på en wire kan appen bruge farven i billedet af den tomme
 skive til at vælge mellem nærliggende felter. Begge kameraer skal vise
 samme tydelige farve, og feltet skal være entydigt blandt kandidaterne.
+
+## Skivekort
+
+Kalibreringen og kastdetektionen bruger samme turneringslayout som Unicorn
+Eclipse Pro 2. Før du gemmer, vises de 20 tal og wirerne på begge billeder.
+Kontrollér især 20 øverst, 6 til højre, 3 nederst og 11 til venstre på den
+fysiske skive. Ved tydelig farveuoverensstemmelse i begge kameraer markeres
+kastet som usikkert.

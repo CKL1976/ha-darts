@@ -19,6 +19,11 @@ options_path = Path("/data/options.json")
 calibration_path = Path("/data/calibration.json")
 sides = ("left", "right")
 sectors = (20, 1, 18, 4, 13, 6, 10, 15, 2, 17, 3, 19, 7, 16, 8, 11, 14, 9, 12, 5)
+sector_angle = 360 / len(sectors)
+bull_inner, bull_outer = 6.35, 15.9
+treble_inner, treble_outer = 99, 107
+double_inner, double_outer = 162, 170
+anchor_sectors = (20, 6, 3, 11)
 reference = None
 empty_board = None
 mappings = None
@@ -54,21 +59,26 @@ def capture_pair():
         return list(pool.map(capture, sides))
 
 
+def board_points(indices, radius, offset=0):
+    angles = np.deg2rad(np.asarray(indices) * sector_angle + offset)
+    return (radius * np.column_stack((np.sin(angles), -np.cos(angles)))).astype(np.float32)
+
+
 def calibration_geometry(points, radius):
     source = np.asarray(points, dtype=np.float32)
     if source.shape not in ((4, 2), (9, 2)) or not np.isfinite(source).all():
         raise ValueError("Ugyldige kalibreringspunkter.")
     if not cv2.isContourConvex(source[:4]) or cv2.contourArea(source[:4]) < 100:
         raise ValueError("De fire punkter på dobbeltringen ligger forkert.")
-    radians = np.deg2rad((-9, 81, 171, 261))
-    directions = np.column_stack((np.sin(radians), -np.cos(radians)))
-    target = radius * directions
+    indices = [sectors.index(sector) for sector in anchor_sectors]
+    target = board_points(indices, radius, -sector_angle / 2)
     if len(source) == 9:
-        target = np.vstack((target, 107 * directions, [0, 0]))
-    return source, target.astype(np.float32)
+        triple = board_points(indices, treble_outer, -sector_angle / 2)
+        target = np.vstack((target, triple, np.zeros((1, 2), dtype=np.float32)))
+    return source, target
 
 
-def transform(points, radius=170):
+def transform(points, radius=double_outer):
     source, target = calibration_geometry(points, radius)
     if len(source) == 4:
         return cv2.getPerspectiveTransform(source, target)
@@ -81,15 +91,15 @@ def transform(points, radius=170):
 
 def field_at(x, y):
     radius = math.hypot(x, y)
-    if radius <= 6.35:
+    if radius <= bull_inner:
         return "DB", 50
-    if radius <= 15.9:
+    if radius <= bull_outer:
         return "SB", 25
-    if radius > 170:
+    if radius > double_outer:
         return "MISS", 0
     angle = math.degrees(math.atan2(x, -y))
-    sector = sectors[int((angle + 9) % 360 // 18)]
-    factor = 3 if 99 <= radius <= 107 else 2 if radius >= 162 else 1
+    sector = sectors[int((angle + sector_angle / 2) % 360 // sector_angle)]
+    factor = 3 if treble_inner <= radius <= treble_outer else 2 if radius >= double_inner else 1
     return f"{' SDT'[factor]}{sector}", factor * sector
 
 
@@ -140,12 +150,17 @@ def surface_color(frame, x, y):
     return next((color for color, pixels in votes.items() if pixels.mean() >= .80), None)
 
 
-def resolve_by_color(fields, hit, before, inverses):
+def colors_at(hit, before, inverses):
     colors = []
     for frame, inverse in zip(before, inverses):
         point = cv2.perspectiveTransform(hit.reshape(1, 1, 2), inverse)[0, 0]
         x, y = np.rint(point).astype(int)
         colors.append(surface_color(frame, x, y))
+    return colors
+
+
+def resolve_by_color(fields, hit, before, inverses):
+    colors = colors_at(hit, before, inverses)
     if colors[0] is None or colors[0] != colors[1] or "MISS" in fields:
         return None
     matches = [field for field in fields if expected_color(field) == colors[0]]
@@ -209,6 +224,12 @@ def detect(masks, transforms, diagnostics=None, before=None):
         reasons.append("near_wire")
     # Use color only for local wire ambiguity. A distant competing impact
     # still needs geometric evidence from both views.
+    if not reasons and before is not None:
+        colors = colors_at(hit, before, inverses)
+        if colors[0] == colors[1] and colors[0] in ("red", "green") and (
+            colors[0] != expected_color(field)
+        ):
+            reasons.append("color_mismatch")
     if near_wire and before is not None and all(other in nearby for other in alternatives):
         nearby[field] = points
         resolved = resolve_by_color(nearby, hit, before, inverses)
@@ -238,6 +259,8 @@ def detect_throw(before, after, mappings, board):
         message = f"Usikkert kast. Bedste bud: {diagnostics['best']['field']}."
         if diagnostics["alternatives"]:
             message += " Andre mulige felter: " + ", ".join(diagnostics["alternatives"]) + "."
+        if "color_mismatch" in reason:
+            message += " Begge kameraer viser en farve, der afviger fra skivekortet."
         if "near_wire" in reason:
             message += " Træfpunktet ligger tæt på en wire."
         raise ValueError(message)
@@ -349,25 +372,28 @@ def state():
 def calibration_preview():
     try:
         data = request.get_json()
-        angles = np.linspace(0, 2 * np.pi, 181, dtype=np.float32)
-        circle = np.column_stack((np.sin(angles), -np.cos(angles)))
-        rings = [circle * radius for radius in (6.35, 15.9, 99, 107, 162, 170)]
-        spokes = []
-        for angle in np.deg2rad(np.arange(-9, 351, 18)):
-            direction = np.float32([np.sin(angle), -np.cos(angle)])
-            spokes.append(np.float32([direction * 15.9, direction * 170]))
+        rings = [board_points(np.linspace(0, len(sectors), 181), radius)
+                 for radius in (bull_inner, bull_outer, treble_inner, treble_outer,
+                                double_inner, double_outer)]
+        inside = board_points(range(len(sectors)), bull_outer, -sector_angle / 2)
+        outside = board_points(range(len(sectors)), double_outer, -sector_angle / 2)
+        spokes = [np.stack((a, b)) for a, b in zip(inside, outside)]
+        number_positions = board_points(range(len(sectors)), double_outer + 13)
+        labels = {}
         overlay = {}
         errors = {}
         for side in sides:
-            inverse = np.linalg.inv(transform(data[side], radius=162))
-            source, target = calibration_geometry(data[side], 162)
+            inverse = np.linalg.inv(transform(data[side], radius=double_inner))
+            source, target = calibration_geometry(data[side], double_inner)
             projected = cv2.perspectiveTransform(target[None], inverse)[0]
             errors[side] = np.round(np.linalg.norm(projected - source, axis=1), 1).tolist()
             overlay[side] = [
                 cv2.perspectiveTransform(line[None], inverse)[0].tolist()
                 for line in rings + spokes
             ]
-        return {**overlay, "errors": errors}
+            labels[side] = cv2.perspectiveTransform(number_positions[None], inverse)[0].tolist()
+        return {**overlay, "errors": errors, "numbers": sectors,
+                "labels": labels}
     except (KeyError, TypeError, ValueError, cv2.error, np.linalg.LinAlgError) as exc:
         return {"error": str(exc)}, 400
 
@@ -382,7 +408,7 @@ def act(action):
                 data = request.get_json()
                 points = {side: data[side] for side in sides}
                 for coordinates in points.values():
-                    transform(coordinates, radius=162)
+                    transform(coordinates, radius=double_inner)
                 temp = calibration_path.with_suffix(".tmp")
                 temp.write_text(json.dumps({**points, "ring": "inner_double"}))
                 temp.replace(calibration_path)
@@ -392,7 +418,7 @@ def act(action):
                 if not calibration_path.exists():
                     raise ValueError("Kalibrér kameraerne først.")
                 points = json.loads(calibration_path.read_text())
-                radius = 162 if points.get("ring") == "inner_double" else 170
+                radius = double_inner if points.get("ring") == "inner_double" else double_outer
                 new_mappings = [transform(points[side], radius) for side in sides]
                 frames = capture_pair()
                 mappings = new_mappings

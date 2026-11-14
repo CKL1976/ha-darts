@@ -219,11 +219,21 @@ async function previewCalibration() {
       for (const point of line.slice(1)) pen.lineTo(...point);
       pen.stroke();
     }
+    pen.font = "bold " + Math.max(18, Math.round(layer.width / 50)) + "px system-ui";
+    pen.textAlign = "center";
+    pen.textBaseline = "middle";
+    pen.lineWidth = 5;
+    pen.strokeStyle = "#101716";
+    pen.fillStyle = "#50e6ff";
+    for (const [index, [x, y]] of data.labels[side].entries()) {
+      pen.strokeText(data.numbers[index], x, y);
+      pen.fillText(data.numbers[index], x, y);
+    }
     layer.hidden = false;
   }
   overlayReady = true;
   const worst = side => Math.max(...data.errors[side]).toFixed(1);
-  get("status").textContent = "Kontrollér de blå linjer. Største afvigelse: venstre " +
+  get("status").textContent = "Sammenlign de blå wirer og tal med skiven. Største afvigelse: venstre " +
     worst("left") + " px, højre " + worst("right") + " px.";
   const combined = labels.map((_, index) => Math.max(...sides.map(side => data.errors[side][index])));
   get("editPoint").selectedIndex = combined.indexOf(Math.max(...combined));
