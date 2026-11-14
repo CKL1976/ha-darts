@@ -1,5 +1,7 @@
 """Fetch still images directly from configured HTTP cameras."""
 
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from http.client import HTTPException
 from threading import Lock
 from time import monotonic
@@ -34,17 +36,37 @@ class SnapshotCamera:
         self.lock = Lock()
         self.frame = None
         self.timestamp = 0
+        self.retry_at = 0
 
     def snapshot(self, preview=False):
         with self.lock:
-            if preview and self.frame is not None and monotonic() - self.timestamp < 2:
+            now = monotonic()
+            if preview and self.frame is not None and (
+                now - self.timestamp < 5 or now < self.retry_at
+            ):
                 return self.frame
+            if now < self.retry_at:
+                raise ValueError("Kameraet begrænser billedhentning. Prøver igen om lidt.")
             try:
                 request = Request(self.url, headers={"Accept": "image/*", "Cache-Control": "no-cache"})
                 with opener.open(request, timeout=8) as response:
                     frame = response.read(MAX_FRAME + 1)
             except HTTPError as exc:
+                retry_after = exc.headers.get("Retry-After", "")
                 exc.close()
+                if exc.code == 429:
+                    if retry_after.isdecimal():
+                        delay = int(retry_after)
+                    else:
+                        try:
+                            retry_time = parsedate_to_datetime(retry_after)
+                            delay = (retry_time - datetime.now(timezone.utc)).total_seconds()
+                        except (TypeError, ValueError, OverflowError):
+                            delay = 5
+                    self.retry_at = monotonic() + max(5, delay)
+                    if preview and self.frame is not None:
+                        return self.frame
+                    raise ValueError("Kameraet begrænser billedhentning. Prøver igen om lidt.") from exc
                 raise ValueError(f"Kameraet returnerede HTTP {exc.code}.") from exc
             except (OSError, HTTPException) as exc:
                 raise ValueError("Kunne ikke hente stillbilledet fra kameraet.") from exc

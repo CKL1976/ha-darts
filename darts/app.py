@@ -303,13 +303,16 @@ def test_deepdarts():
             saved = saved_calibration()
             radius = double_inner if saved.get("ring") == "inner_double" else double_outer
             transforms = [transform(saved[side], radius) for side in camera_roles]
+            if empty_board is None:
+                raise ValueError("Tøm skiven og vælg Nulstil med tom skive før testen.")
             frames = capture_pair()
+            is_clear = board_is_clear(frames, empty_board)
             results = {}
             for name, frontal in (("Oprettet billede", True), ("Kameravinkel", False)):
-                views = [
-                    [point for point in model_points(frame, mapping, frontal=frontal)
-                     if np.isfinite(point).all() and field_at(*point)[0] != "MISS"]
-                    for frame, mapping in zip(frames, transforms)
+                views = [[], []] if is_clear else [
+                    new_model_points(model_points(frame, mapping, frontal=frontal),
+                                     baseline, frame, mapping)
+                    for baseline, frame, mapping in zip(empty_board, frames, transforms)
                 ]
                 results[name] = {"left": len(views[0]), "right": len(views[1]),
                                  "fields": [[field_at(*point)[0] for point in view] for view in views],
