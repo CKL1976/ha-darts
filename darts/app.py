@@ -293,7 +293,8 @@ def center_hit(mask, mapping):
     if field == "MISS":
         return None
     return {"field": field, "points": points,
-            "x_mm": round(float(hit[0]), 1), "y_mm": round(float(hit[1]), 1)}
+            "x_mm": round(float(hit[0]), 1), "y_mm": round(float(hit[1]), 1),
+            "center_pixel": tip[0, 0].tolist()}
 
 
 def validate_center(hit, masks, transforms, board):
@@ -303,7 +304,8 @@ def validate_center(hit, masks, transforms, board):
     verified = detect(masks[:2], transforms[:2], before=board[:2], near=position)
     if verified is None:
         return {**hit, "center_field": hit["field"], "validation": "unconfirmed"}
-    return {**verified, "center_field": hit["field"], "validation": "side_cameras"}
+    return {**verified, "center_pixel": hit["center_pixel"],
+            "center_field": hit["field"], "validation": "side_cameras"}
 
 
 def detect_throw(before, after, mappings, board, primary=None):
@@ -357,7 +359,17 @@ def image(side):
 
 
 def turn_state():
-    return {"darts": list(darts), "total": sum(d["points"] for d in darts),
+    views = {}
+    if mappings is not None:
+        for side, mapping in zip(cameras, mappings):
+            markers = []
+            for dart in darts:
+                position = np.float32([[[dart["x_mm"], dart["y_mm"]]]])
+                pixel = project(position, mapping, backwards=True)[0, 0]
+                markers.append({"final": pixel.tolist(),
+                                "initial": dart.get("center_pixel") if side == "third" else None})
+            views[side] = markers
+    return {"camera_hits": views, "darts": list(darts), "total": sum(d["points"] for d in darts),
             "status": status,
             "mqtt": entities.connection_status if entities else "Angiv mqtt_host i Konfiguration"}
 

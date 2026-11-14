@@ -39,7 +39,7 @@ canvas{display:block;width:100%;height:auto;cursor:crosshair;margin-bottom:14px}
 <figure><figcaption>Venstre kamera</figcaption><div class="camera-frame"><img id="left" alt="Venstre kamerabillede"><canvas id="leftOverlay" hidden></canvas></div></figure>
 <figure><figcaption>Højre kamera</figcaption><div class="camera-frame"><img id="right" alt="Højre kamerabillede"><canvas id="rightOverlay" hidden></canvas></div></figure>
 {% if third_camera %}
-<figure><figcaption>Center Cam</figcaption><div class="camera-frame"><img id="third" alt="RTSP-kamerabillede"><canvas id="thirdOverlay" hidden></canvas></div></figure>
+<figure><figcaption>Center Cam · gult kryds: fundet spids · blå ring: beregnet træf</figcaption><div class="camera-frame"><img id="third" alt="RTSP-kamerabillede"><canvas id="thirdOverlay" hidden></canvas></div></figure>
 {% endif %}
 <figure>
   <figcaption>Dartskive · træfpunkter</figcaption>
@@ -187,8 +187,43 @@ function drawBoard(darts) {
     ? darts.map((dart, index) => "Pil " + (index + 1) + " " + dart.field).join(", ")
     : "Dartskive uden registrerede pile");
 }
+function drawCameraHits(data) {
+  if (points) return;
+  for (const side of sides) {
+    const img = get(side);
+    const layer = get(side + "Overlay");
+    const hits = data.camera_hits?.[side] ?? [];
+    layer.hidden = !hits.length || !img.naturalWidth;
+    if (layer.hidden) continue;
+    layer.width = img.naturalWidth;
+    layer.height = img.naturalHeight;
+    const pen = layer.getContext("2d");
+    const scale = layer.width / Math.max(1, img.clientWidth);
+    pen.font = "bold " + 12 * scale + "px system-ui";
+    pen.lineWidth = 2 * scale;
+    for (const [index, hit] of hits.entries()) {
+      if (hit.initial) {
+        const [x, y] = hit.initial;
+        pen.strokeStyle = "#ffdc53";
+        pen.beginPath();
+        pen.moveTo(x - 6 * scale, y);
+        pen.lineTo(x + 6 * scale, y);
+        pen.moveTo(x, y - 6 * scale);
+        pen.lineTo(x, y + 6 * scale);
+        pen.stroke();
+      }
+      const [x, y] = hit.final;
+      pen.strokeStyle = pen.fillStyle = "#50e6ff";
+      pen.beginPath();
+      pen.arc(x, y, 8 * scale, 0, 2 * Math.PI);
+      pen.stroke();
+      pen.fillText(index + 1, x + 10 * scale, y);
+    }
+  }
+}
 function drawTurn(data) {
   drawBoard(data.darts);
+  drawCameraHits(data);
   get("score").textContent = data.total + " point";
   get("throws").textContent = data.darts.map(d => {
     if (!d.center_field) return d.field;
