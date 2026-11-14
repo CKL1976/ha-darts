@@ -20,7 +20,6 @@ canvas{display:block;width:100%;height:auto;cursor:crosshair;margin-bottom:14px}
 #crop{touch-action:none}
 </style>
 <h1>HA Darts</h1>
-<p><a href="diagnostics" style="color:#50e6ff">Optag og markér pilespidser</a></p>
 <details id="cameraSettings"{% if not configured %} open{% endif %}>
 <summary>Kameraer</summary>
 <form id="cameraForm">
@@ -242,18 +241,6 @@ function drawCameraHits(data) {
     pen.lineWidth = 2 * scale;
     for (const [index, hit] of hits.entries()) {
       const [x, y] = hit.tip;
-      pen.lineCap = "round";
-      pen.beginPath();
-      if (hit.start) {
-        pen.moveTo(...hit.start);
-        pen.lineTo(x, y);
-        pen.strokeStyle = "#101716";
-        pen.lineWidth = 5 * scale;
-        pen.stroke();
-        pen.strokeStyle = "#ffdc53";
-        pen.lineWidth = 2 * scale;
-        pen.stroke();
-      }
       pen.strokeStyle = pen.fillStyle = "#50e6ff";
       pen.beginPath();
       pen.arc(x, y, 8 * scale, 0, 2 * Math.PI);

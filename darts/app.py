@@ -11,12 +11,9 @@ import numpy as np
 from flask import Flask, Response, abort, render_template, request
 from waitress import serve
 from scipy import ndimage
-from skimage.feature import canny
-from skimage.transform import probabilistic_hough_line
 from scipy.interpolate import LinearNDInterpolator
 from scipy.optimize import least_squares
 
-from diagnostics import diagnostics, capture_sample
 
 from camera import SnapshotCamera
 from deepdarts import DeepDarts, MAX_MODEL_BYTES
@@ -25,7 +22,6 @@ from imaging import (decode_image, encode_image, fit_homography, grayscale,
 from mqtt_entities import DartEntities
 
 app = Flask(__name__)
-app.register_blueprint(diagnostics)
 lock = Lock()
 options_path = Path("/data/options.json")
 calibration_path = Path("/data/calibration.json")
@@ -52,7 +48,6 @@ status = "Indtast snapshotadresserne under Kameraer."
 darts = []
 entities = None
 cameras = {}
-diagnostic_before = None
 
 
 
@@ -201,65 +196,12 @@ def field_at(x, y):
     return f"{' SDT'[factor]}{sector}", factor * sector
 
 
-def axes(mask, mapping):
-    # In both mounted camera views the flight is above the tip. Use the
-    # silhouette's width along each near-vertical edge to find the taper.
-    edges = canny(mask, low_threshold=40, high_threshold=100)
-    scale = mask.shape[0] / 1536
-    segments = probabilistic_hough_line(edges, threshold=24,
-                                       line_length=max(18, round(40 * scale)),
-                                       line_gap=max(5, round(12 * scale)), rng=0)
-    if not segments:
-        return []
-    segments = np.asarray(segments)
-    lengths = np.linalg.norm(segments[:, 1] - segments[:, 0], axis=1)
-    result = []
-    along = np.arange(-75, 125, 2, dtype=np.float32) * scale
-    across = np.arange(-16, 17, dtype=np.float32) * scale
-    for index in np.argsort(lengths)[-70:][::-1]:
-        top, bottom = sorted(segments[index], key=lambda point: point[1])
-        direction = (bottom - top) / lengths[index]
-        if direction[1] < .78:
-            continue
-        normal = np.array([direction[1], -direction[0]])
-        grid = bottom + along[:, None, None] * direction + across[None, :, None] * normal
-        profile = sample_image(mask, grid, order=0) > 0
-        # A barrel has support on several adjacent cross-sections. The
-        # support narrows at the point and disappears beyond the board entry.
-        width = profile.sum(axis=1)
-        central = profile[:, 7:26].any(axis=1)
-        for tip_index in range(20, len(along) - 8):
-            body = width[tip_index-20:tip_index-6]
-            tip_width = width[tip_index-4:tip_index+1]
-            if (np.count_nonzero((body >= 5) & (body <= 26)) < 9
-                    or np.count_nonzero(central[tip_index-4:tip_index+1]) < 3
-                    or np.median(tip_width) > .75 * np.median(body)
-                    or np.count_nonzero(central[tip_index+1:tip_index+9]) > 1):
-                continue
-            tip_columns = np.where(profile[tip_index-4:tip_index+1, 7:26])[1] + 7
-            tip = grid[tip_index, 16] + np.median(across[tip_columns]) * normal
-            body_center = grid[tip_index-17, 16]
-            body_columns = np.where(profile[tip_index-20:tip_index-6])[1]
-            start = body_center + np.median(across[body_columns]) * normal
-            board_tip = project(np.float32([[tip]]), mapping)[0, 0]
-            if np.isfinite(board_tip).all() and field_at(*board_tip)[0] != "MISS":
-                result.append((board_tip, start))
-    return result
-
-
-def detect(masks, transforms, diagnostics=None):
-    views = [axes(mask, mapping) for mask, mapping in zip(masks, transforms)]
-    if diagnostics is not None:
-        diagnostics["tip_counts"] = [len(view) for view in views]
-    return match_tips(views, transforms)
-
-
 def match_tips(views, transforms):
     if not all(views):
         return None
     left, right = views
-    left_points = np.array([candidate[0] for candidate in left], dtype=np.float32)
-    right_points = np.array([candidate[0] for candidate in right], dtype=np.float32)
+    left_points = np.asarray(left, dtype=np.float32)
+    right_points = np.asarray(right, dtype=np.float32)
     distances = np.linalg.norm(left_points[:, None] - right_points, axis=2)
     left_index, right_index = np.unravel_index(distances.argmin(), distances.shape)
     if distances[left_index, right_index] > 9:
@@ -267,10 +209,9 @@ def match_tips(views, transforms):
     hit = (left_points[left_index] + right_points[right_index]) / 2
     field, points = field_at(*hit)
     lines_by_view = []
-    for mapping, (_, start) in zip(transforms, (left[left_index], right[right_index])):
+    for mapping in transforms:
         pixel = project(hit.reshape(1, 1, 2), mapping, backwards=True)[0, 0]
-        lines_by_view.append({"start": start.tolist() if start is not None else None,
-                              "tip": pixel.tolist()})
+        lines_by_view.append({"tip": pixel.tolist()})
     return {"field": field, "points": points,
             "x_mm": round(float(hit[0]), 1), "y_mm": round(float(hit[1]), 1),
             "camera_lines": lines_by_view}
@@ -284,38 +225,26 @@ def change_mask(previous, current):
 
 
 def detect_throw(before, after, mappings):
-    masks = [change_mask(previous, current)
-             for previous, current in zip(before, after)]
-    diagnostics = {}
-    hit = None
-    if deepdarts_model is not None:
-        try:
-            views = []
-            for frame, mask, mapping in zip(after, masks, mappings):
-                candidates = []
-                for tip in deepdarts_model.tips(frame):
-                    x, y = np.rint(tip).astype(int)
-                    if not mask[max(y-8, 0):y+9, max(x-8, 0):x+9].any():
-                        continue
-                    point = project(tip.reshape(1, 1, 2), mapping)[0, 0]
-                    if np.isfinite(point).all() and field_at(*point)[0] != "MISS":
-                        candidates.append((point, None))
-                views.append(candidates)
-            hit = match_tips(views, mappings)
-            if hit is not None:
-                hit["detector"] = "deepdarts"
-        except RuntimeError:
-            app.logger.exception("DeepDarts kunne ikke analysere kastet")
+    model = deepdarts_model
+    if model is None:
+        raise ValueError("Upload en DeepDarts-model for at registrere kast.")
+    views = []
+    for previous, frame, mapping in zip(before, after, mappings):
+        mask = change_mask(previous, frame)
+        candidates = []
+        for tip in model.tips(frame):
+            x, y = np.rint(tip).astype(int)
+            if not mask[max(y-8, 0):y+9, max(x-8, 0):x+9].any():
+                continue
+            point = project(tip.reshape(1, 1, 2), mapping)[0, 0]
+            if np.isfinite(point).all() and field_at(*point)[0] != "MISS":
+                candidates.append(point)
+        views.append(candidates)
+    hit = match_tips(views, mappings)
     if hit is None:
-        hit = detect(masks, mappings, diagnostics)
-    try:
-        capture_sample(before, after, hit, json.loads(calibration_path.read_text()), camera_selection())
-    except (OSError, ValueError):
-        app.logger.exception("Kunne ikke gemme detektionsbilleder")
-    if hit is not None:
-        return hit
-    counts = "/".join(map(str, diagnostics["tip_counts"]))
-    raise ValueError(f"Fandt ingen pilespidser, der stemmer overens. Kandidater pr. kamera: {counts}.")
+        counts = "/".join(str(len(view)) for view in views)
+        raise ValueError(f"DeepDarts fandt intet fælles træf. Kandidater pr. kamera: {counts}.")
+    return hit
 
 
 @app.post("/deepdarts/model")
@@ -339,36 +268,6 @@ def install_deepdarts():
     except (ImportError, OSError, RuntimeError, ValueError) as exc:
         return {"error": f"Modellen kunne ikke indlæses: {exc}"}, 400
     return {"active": True}
-
-
-@app.post("/samples/capture")
-def capture_diagnostic_pair():
-    global diagnostic_before
-    data = request.get_json(silent=True)
-    stage = data.get("stage") if isinstance(data, dict) else None
-    if stage not in ("before", "after"):
-        return {"error": "Vælg før eller efter kast."}, 400
-    with lock:
-        try:
-            calibration = saved_calibration()
-            selection = camera_selection()
-            if stage == "after" and (
-                diagnostic_before is None
-                or diagnostic_before[1:] != (selection, calibration)
-            ):
-                raise ValueError("Tag et nyt førbillede først.")
-            frames = capture_pair()
-            if stage == "before":
-                diagnostic_before = (frames, selection, calibration)
-                return {"saved": True}
-            before = diagnostic_before[0]
-            if any(first.shape != last.shape for first, last in zip(before, frames)):
-                raise ValueError("Billedstørrelsen har ændret sig. Tag et nyt førbillede.")
-            sample_id = capture_sample(before, frames, None, calibration, selection, manual=True)
-            diagnostic_before = None
-            return {"id": sample_id}
-        except (OSError, ValueError) as exc:
-            return {"error": str(exc)}, 400
 
 
 def camera_selection():
@@ -469,7 +368,8 @@ def turn_state():
                 for dart in darts
             ]
     return {"camera_hits": views, "darts": list(darts), "total": sum(d["points"] for d in darts),
-            "status": status,
+            "status": ("Upload en DeepDarts-model for at registrere kast."
+                       if deepdarts_model is None and reference is not None else status),
             "mqtt": entities.connection_status if entities else "Angiv mqtt_host i Konfiguration"}
 
 
@@ -600,7 +500,7 @@ def watch_board():
                     prepare_board(capture_pair(), points)
                 else:
                     analyze_frames(capture_pair())
-            except (OSError, ValueError, KeyError, np.linalg.LinAlgError) as exc:
+            except (OSError, ValueError, RuntimeError, KeyError, np.linalg.LinAlgError) as exc:
                 pending = None
                 startup_frames = None
                 clear_frames = 0

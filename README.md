@@ -81,5 +81,5 @@ Modelfilen skal skaffes separat. Se [DeepDarts-artiklen](https://arxiv.org/abs/2
 og [forskernes kode og modelhenvisninger](https://github.com/wmcnally/deep-darts).
 
 Appen bruger modellen til at finde spidser i begge kamerabilleder og
-beregner scoren ud fra den gemte kamerakalibrering. Den almindelige
-detektor tager over, når DeepDarts ikke finder et match mellem kameraerne.
+beregner scoren ud fra den gemte kamerakalibrering. En aktiv DeepDarts-model
+og et match mellem kameraerne er nødvendige for at registrere et kast.
