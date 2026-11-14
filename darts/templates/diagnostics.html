@@ -13,7 +13,10 @@ output{display:block;padding:12px}dialog{max-width:90vw;background:#182522;color
 <a href="./">Tilbage til HA Darts</a>
 <h1>Optag og markér pilespidser</h1>
 <p>Start optagelse, gå tilbage og kast én pil ad gangen. Der gemmes originale før- og efterbilleder, også når detektionen fejler. Højst 60 billedpar gemmes lokalt.</p>
+<p>Du kan også tage førbilleder, kaste én pil og gemme efterbilleder direkte her.</p>
 <button id="record">Start optagelse</button>
+<button id="before">Tag førbilleder</button>
+<button id="after">Gem efterbilleder</button>
 <button id="reload">Opdatér liste</button>
 <a href="samples/export">Download billeder og markeringer</a>
 <output id="status" aria-live="polite"></output>
@@ -36,7 +39,10 @@ const sides=["left","right"];
 let entries=[], current=null, tips={}, images={}, recording=false, zoom=null, generation=0;
 async function api(path,body){
  const response=await fetch(path,body?{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}:{cache:"no-store"});
- if(!response.ok) throw Error("Handlingen mislykkedes ("+response.status+").");
+ if(!response.ok){
+  const data=await response.json().catch(()=>({}));
+  throw Error(data.error??("Handlingen mislykkedes ("+response.status+")."));
+ }
  return response.json();
 }
 async function run(fn){try{await fn();}catch(error){get("status").textContent=error.message;}}
@@ -46,7 +52,7 @@ async function refresh(){
  get("status").textContent=entries.length+" / "+data.limit+" billedpar. "+(recording?"Optagelse aktiv.":"Optagelse stoppet.");
  const previous=get("samples").value;
  get("samples").replaceChildren(new Option("Vælg billedpar",""),...entries.map(entry=>new Option(
- new Date(entry.created*1000).toLocaleTimeString()+" · "+(entry.prediction?.field??"Intet træf")+" · "+(Object.keys(entry.tips).length===2?"markeret":"mangler markering"),entry.id)));
+ new Date(entry.created*1000).toLocaleTimeString()+" · "+(entry.prediction?.field??"Ingen automatisk score")+" · "+(Object.keys(entry.tips).length===2?"markeret":"mangler markering"),entry.id)));
  get("samples").value=previous;
 }
 function paint(side){
@@ -98,6 +104,20 @@ get("zoom").onclick=event=>{
 get("confirm").onclick=()=>{tips[zoom.side]=zoom.point;paint(zoom.side);get("dialog").close();get("save").disabled=Object.keys(tips).length!==2;};
 get("cancel").onclick=()=>get("dialog").close();
 get("record").onclick=()=>run(async()=>{await api("samples",{recording:!recording});await refresh();});
+for(const stage of ["before","after"])get(stage).onclick=()=>run(async()=>{
+ get("before").disabled=get("after").disabled=true;
+ try{
+  const result=await api("samples/capture",{stage});
+  if(stage==="before"){
+   get("status").textContent="Førbilleder klar. Kast én pil, og gem efterbillederne.";
+  }else{
+   await refresh();
+   get("samples").value=result.id;
+   get("stage").value="after";
+   await load();
+  }
+ }finally{get("before").disabled=get("after").disabled=false;}
+});
 get("reload").onclick=()=>run(refresh);
 get("samples").onchange=()=>run(load);
 get("stage").onchange=()=>run(load);

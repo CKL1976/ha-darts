@@ -45,6 +45,7 @@ status = "Indtast snapshotadresserne under Kameraer."
 darts = []
 entities = None
 cameras = {}
+diagnostic_before = None
 
 
 
@@ -281,12 +282,42 @@ def detect_throw(before, after, mappings):
     hit = detect(masks, mappings, diagnostics)
     try:
         capture_sample(before, after, hit, json.loads(calibration_path.read_text()), camera_selection())
-    except (OSError, ValueError):
+    except (OSError, ValueError, cv2.error):
         app.logger.exception("Kunne ikke gemme detektionsbilleder")
     if hit is not None:
         return hit
     counts = "/".join(map(str, diagnostics["tip_counts"]))
     raise ValueError(f"Fandt ingen pilespidser, der stemmer overens. Kandidater pr. kamera: {counts}.")
+
+
+@app.post("/samples/capture")
+def capture_diagnostic_pair():
+    global diagnostic_before
+    data = request.get_json(silent=True)
+    stage = data.get("stage") if isinstance(data, dict) else None
+    if stage not in ("before", "after"):
+        return {"error": "Vælg før eller efter kast."}, 400
+    with lock:
+        try:
+            calibration = saved_calibration()
+            selection = camera_selection()
+            if stage == "after" and (
+                diagnostic_before is None
+                or diagnostic_before[1:] != (selection, calibration)
+            ):
+                raise ValueError("Tag et nyt førbillede først.")
+            frames = capture_pair()
+            if stage == "before":
+                diagnostic_before = (frames, selection, calibration)
+                return {"saved": True}
+            before = diagnostic_before[0]
+            if any(first.shape != last.shape for first, last in zip(before, frames)):
+                raise ValueError("Billedstørrelsen har ændret sig. Tag et nyt førbillede.")
+            sample_id = capture_sample(before, frames, None, calibration, selection, manual=True)
+            diagnostic_before = None
+            return {"id": sample_id}
+        except (OSError, ValueError, cv2.error) as exc:
+            return {"error": str(exc)}, 400
 
 
 def camera_selection():

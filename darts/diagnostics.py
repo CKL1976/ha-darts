@@ -19,14 +19,16 @@ last_saved = 0.0
 limit = 60
 
 
-def capture_sample(before, after, prediction, calibration, cameras):
+def capture_sample(before, after, prediction, calibration, cameras, *, manual=False):
     global last_saved, recording
     with guard:
-        if not recording or time() - last_saved < 4:
+        if not manual and (not recording or time() - last_saved < 4):
             return
         root.mkdir(parents=True, exist_ok=True)
         if len(list(root.glob("*/sample.json"))) >= limit:
             recording = False
+            if manual:
+                raise ValueError("Der er plads til højst 60 optagelser.")
             return
         sample_id = uuid4().hex
         folder = root / sample_id
@@ -45,6 +47,7 @@ def capture_sample(before, after, prediction, calibration, cameras):
             }
             (folder / "sample.json").write_text(json.dumps(metadata))
             last_saved = time()
+            return sample_id
         except Exception:
             for file in folder.iterdir():
                 file.unlink()

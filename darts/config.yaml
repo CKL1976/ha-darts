@@ -1,7 +1,7 @@
 name: HA Darts
-version: "0.2.39"
+version: "0.2.40"
 slug: ha_darts
-description: Dart detection from Home Assistant camera entities
+description: Dart detection from two HTTP snapshot cameras
 url: https://github.com/CKL1976/ha-darts
 arch:
   - amd64
