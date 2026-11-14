@@ -67,9 +67,9 @@ og gem, hvis overlejringen passer. Kastdetektionen scorer den bedst
 rangerede kandidat, når den bekræftes i to aflæsninger. MQTT-status viser
 brokerens kvittering for pointværdien.
 
-Tilføj eventuelt en RTSP-adresse i `third_camera_url` i appens konfiguration.
-Kamera 3 vises i appen som løbende opdaterede billeder uden lyd.
+Tilføj eventuelt en RTSP-adresse i `center_cam` i appens konfiguration.
+Center Cam vises i appen som løbende opdaterede billeder uden lyd.
 
-Når kamera 3 er konfigureret, skal alle tre kameraer kalibreres manuelt
+Når Center Cam er konfigureret, skal alle tre kameraer kalibreres manuelt
 én gang. Alle tre indgår derefter i auto-kalibrering og kastdetektion.
 Skiven og alle ni kalibreringspunkter skal være synlige i RTSP-billedet.

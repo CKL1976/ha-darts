@@ -35,7 +35,7 @@ canvas{display:block;width:100%;height:auto;cursor:crosshair;margin-bottom:14px}
 <figure><figcaption>Venstre kamera</figcaption><div class="camera-frame"><img id="left" alt="Venstre kamerabillede"><canvas id="leftOverlay" hidden></canvas></div></figure>
 <figure><figcaption>Højre kamera</figcaption><div class="camera-frame"><img id="right" alt="Højre kamerabillede"><canvas id="rightOverlay" hidden></canvas></div></figure>
 {% if third_camera %}
-<figure><figcaption>Kamera 3</figcaption><div class="camera-frame"><img id="third" alt="RTSP-kamerabillede"><canvas id="thirdOverlay" hidden></canvas></div></figure>
+<figure><figcaption>Center Cam</figcaption><div class="camera-frame"><img id="third" alt="RTSP-kamerabillede"><canvas id="thirdOverlay" hidden></canvas></div></figure>
 {% endif %}
 </div>
 <dialog id="zoom">
@@ -49,7 +49,7 @@ canvas{display:block;width:100%;height:auto;cursor:crosshair;margin-bottom:14px}
 const get = id => document.getElementById(id);
 const sides = ["left", "right"];
 if (get("third")) sides.push("third");
-const cameraNames = {left: "Venstre kamera", right: "Højre kamera", third: "Kamera 3"};
+const cameraNames = {left: "Venstre kamera", right: "Højre kamera", third: "Center Cam"};
 const completed = () => points && sides.every(side => points[side].length === labels.length);
 const stepIndex = () => Math.min(...sides.map(side => points[side].length));
 const wires = ["5/20", "13/6", "17/3", "8/11"];

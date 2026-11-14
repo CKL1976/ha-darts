@@ -385,7 +385,7 @@ def auto_calibrate():
             try:
                 fitted = refine_calibration(frame, initial)
             except ValueError as exc:
-                name = {"left": "Venstre kamera", "right": "Højre kamera", "third": "Kamera 3"}[side]
+                name = {"left": "Venstre kamera", "right": "Højre kamera", "third": "Center Cam"}[side]
                 raise ValueError(f"{name}: {exc}") from exc
             anchors = np.vstack((
                 board_points([sectors.index(n) for n in anchor_sectors], double_inner, -sector_angle / 2),
@@ -476,8 +476,9 @@ if __name__ == "__main__":
     options = json.loads(options_path.read_text())
     cameras = {side: CameraFeed(options.get(f"{side}_live_url") or options[f"{side}_url"])
                for side in sides}
-    if options.get("third_camera_url"):
-        cameras["third"] = RtspFeed(options["third_camera_url"])
+    center_cam_url = options.get("center_cam") or options.get("third_camera_url")
+    if center_cam_url:
+        cameras["third"] = RtspFeed(center_cam_url)
     if options.get("mqtt_host"):
         entities = DartEntities(options)
     Thread(target=watch_board, daemon=True).start()
