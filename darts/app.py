@@ -215,7 +215,7 @@ def colors_at(hit, before, inverses):
     return colors
 
 
-def detect(masks, transforms, diagnostics=None, before=None):
+def detect(masks, transforms, diagnostics=None, before=None, near=None):
     lines = [axes(mask, transform) for mask, transform in zip(masks, transforms)]
     if diagnostics is not None:
         diagnostics["line_counts"] = [len(view) for view in lines]
@@ -229,6 +229,8 @@ def detect(masks, transforms, diagnostics=None, before=None):
                 if abs(np.linalg.det(system)) < 0.22:
                     continue
                 hit = a + np.linalg.solve(system, b - a)[0] * u
+                if near is not None and np.linalg.norm(hit - near) > 18:
+                    continue
                 field, points = field_at(*hit)
                 if field == "MISS":
                     continue
@@ -271,6 +273,20 @@ def center_hit(mask, mapping):
         return None
     pixels = contour.reshape(-1, 2)
     bottom = pixels[pixels[:, 1] >= pixels[:, 1].max() - 2]
+    # Opening can erase the thin steel tip. Follow the raw mask just
+    # below the barrel, keeping the search close to its shaft direction.
+    vx, vy, cx, cy = cv2.fitLine(contour, cv2.DIST_L2, 0, .01, .01).ravel()
+    edge_y = int(bottom[:, 1].max())
+    if abs(vy) > .35:
+        for row in range(edge_y + 1, min(mask.shape[0], edge_y + min(32, height // 4))):
+            expected_x = int(round(cx + (row - cy) * vx / vy))
+            left, right = max(0, expected_x - 4), min(mask.shape[1], expected_x + 5)
+            if left >= right:
+                break
+            columns = np.flatnonzero(mask[row, left:right])
+            if not len(columns):
+                break
+            bottom = np.float32([[left + np.median(columns), row]])
     tip = np.float32([[np.median(bottom, axis=0)]])
     hit = project(tip, mapping)[0, 0]
     field, points = field_at(*hit)
@@ -281,22 +297,13 @@ def center_hit(mask, mapping):
 
 
 def validate_center(hit, masks, transforms, board):
-    position = np.float32([[[hit["x_mm"], hit["y_mm"]]]])
-    cropped_masks = []
-    for mask, mapping in zip(masks[:2], transforms[:2]):
-        x, y = np.rint(project(position, mapping, backwards=True)[0, 0]).astype(int)
-        crop = np.zeros_like(mask)
-        left, right = max(0, x-110), min(mask.shape[1], x+111)
-        top, bottom = max(0, y-110), min(mask.shape[0], y+111)
-        if left >= right or top >= bottom:
-            return hit
-        crop[top:bottom, left:right] = mask[top:bottom, left:right]
-        cropped_masks.append(crop)
-    verified = detect(cropped_masks, transforms[:2], before=board[:2])
-    if verified and math.hypot(hit["x_mm"] - verified["x_mm"],
-                               hit["y_mm"] - verified["y_mm"]) <= 18:
-        return verified
-    return hit
+    position = np.float32([hit["x_mm"], hit["y_mm"]])
+    # Find real edges before applying the spatial constraint. Cutting the
+    # binary masks first introduces straight edges at the crop boundaries.
+    verified = detect(masks[:2], transforms[:2], before=board[:2], near=position)
+    if verified is None:
+        return {**hit, "center_field": hit["field"], "validation": "unconfirmed"}
+    return {**verified, "center_field": hit["field"], "validation": "side_cameras"}
 
 
 def detect_throw(before, after, mappings, board, primary=None):
