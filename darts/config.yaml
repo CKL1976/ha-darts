@@ -1,5 +1,5 @@
 name: HA Darts
-version: "0.2.12"
+version: "0.2.13"
 slug: ha_darts
 description: Dart detection from two GRAN EYE IP cameras
 url: https://github.com/CKL1976/ha-darts
@@ -27,3 +27,4 @@ schema:
   mqtt_username: str
   mqtt_password: password
   mqtt_discovery_prefix: str
+  third_camera_url: str?

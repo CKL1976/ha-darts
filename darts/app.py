@@ -11,7 +11,7 @@ import numpy as np
 from flask import Flask, Response, abort, render_template, request
 from waitress import serve
 
-from camera import CameraFeed
+from camera import CameraFeed, RtspFeed
 from mqtt_entities import DartEntities
 
 app = Flask(__name__)
@@ -232,12 +232,12 @@ def detect_throw(before, after, mappings, board):
 
 @app.get("/")
 def index():
-    return render_template("index.html")
+    return render_template("index.html", third_camera="third" in cameras)
 
 
 @app.get("/image/<side>")
 def image(side):
-    if side not in sides:
+    if side not in cameras:
         abort(404)
     try:
         jpeg, _ = cameras[side].latest()
@@ -478,6 +478,8 @@ if __name__ == "__main__":
     options = json.loads(options_path.read_text())
     cameras = {side: CameraFeed(options.get(f"{side}_live_url") or options[f"{side}_url"])
                for side in sides}
+    if options.get("third_camera_url"):
+        cameras["third"] = RtspFeed(options["third_camera_url"])
     if options.get("mqtt_host"):
         entities = DartEntities(options)
     Thread(target=watch_board, daemon=True).start()

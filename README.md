@@ -66,3 +66,6 @@ giver startposition og retning. Kontrollér forslaget i begge billeder,
 og gem, hvis overlejringen passer. Kastdetektionen scorer den bedst
 rangerede kandidat, når den bekræftes i to aflæsninger. MQTT-status viser
 brokerens kvittering for pointværdien.
+
+Tilføj eventuelt en RTSP-adresse i `third_camera_url` i appens konfiguration.
+Kamera 3 vises i appen som løbende opdaterede billeder uden lyd.

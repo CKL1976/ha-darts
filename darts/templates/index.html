@@ -34,6 +34,9 @@ canvas{display:block;width:100%;height:auto;cursor:crosshair;margin-bottom:14px}
 <div class="views">
 <figure><figcaption>Venstre kamera</figcaption><div class="camera-frame"><img id="left" alt="Venstre kamerabillede"><canvas id="leftOverlay" hidden></canvas></div></figure>
 <figure><figcaption>Højre kamera</figcaption><div class="camera-frame"><img id="right" alt="Højre kamerabillede"><canvas id="rightOverlay" hidden></canvas></div></figure>
+{% if third_camera %}
+<figure><figcaption>Kamera 3</figcaption><img id="third" alt="RTSP-kamerabillede"></figure>
+{% endif %}
 </div>
 <dialog id="zoom">
 <h2 id="zoomTitle"></h2>
@@ -73,6 +76,8 @@ function controls() {
   get("calibrate").textContent = points ? "Afbryd kalibrering" : "Kalibrér";
 }
 async function refresh() {
+  const third = get("third");
+  if (third && !points) third.src = "image/third?t=" + Date.now();
   await Promise.all(sides.map(side => new Promise((resolve, reject) => {
     const img = get(side);
     img.onload = resolve;

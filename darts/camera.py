@@ -71,3 +71,37 @@ class CameraFeed:
             ):
                 raise ValueError(self.error if self.frame is None else "Kamerabilledet opdateres ikke.")
             return self.frame, self.updated
+
+
+class RtspFeed(CameraFeed):
+    def watch(self):
+        import cv2
+
+        while True:
+            source = cv2.VideoCapture()
+            try:
+                source.open(self.url, cv2.CAP_FFMPEG, [
+                    cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 4000,
+                    cv2.CAP_PROP_READ_TIMEOUT_MSEC, 4000,
+                ])
+                next_preview = 0
+                while source.isOpened():
+                    ok, frame = source.read()
+                    if not ok:
+                        break
+                    now = monotonic()
+                    if now < next_preview:
+                        continue
+                    ok, jpeg = cv2.imencode(".jpg", frame)
+                    if ok:
+                        with self.condition:
+                            self.frame = jpeg.tobytes()
+                            self.updated = now
+                            self.condition.notify_all()
+                    next_preview = now + .2
+                self.error = "RTSP-kameraet leverer ikke billeder. Prøver igen."
+            except cv2.error:
+                self.error = "Kunne ikke læse RTSP-kameraet. Prøver igen."
+            finally:
+                source.release()
+            sleep(1)
