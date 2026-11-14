@@ -8,6 +8,7 @@ import paho.mqtt.client as mqtt
 
 LOGGER = logging.getLogger(__name__)
 BASE = "ha_darts"
+PIL_KEYS = ("pil_1", "pil_2", "pil_3")
 SENSOR = "seneste_kast"
 STATE_TOPIC = f"{BASE}/sensor/{SENSOR}"
 OBSOLETE = (
@@ -22,6 +23,7 @@ class DartEntities:
     def __init__(self, options):
         self.lock = Lock()
         self.last_score = None
+        self.turn_scores = {}
         self.pending_score = None
         self.discovery_prefix = options.get("mqtt_discovery_prefix", "homeassistant")
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
@@ -69,6 +71,17 @@ class DartEntities:
             "value_template": "{{ value | int }}",
             "device": {"identifiers": [BASE], "name": "HA Darts"},
         }))
+        for number, key in enumerate(PIL_KEYS, 1):
+            self.send(self.discovery_topic("sensor", key), json.dumps({
+                "name": f"Pil {number}",
+                "unique_id": f"{BASE}_{key}",
+                "default_entity_id": f"sensor.{BASE}_{key}",
+                "state_topic": f"{BASE}/sensor/{key}",
+                "unit_of_measurement": "point",
+                "value_template": "{{ value | int if value != 'None' else none }}",
+                "device": {"identifiers": [BASE], "name": "HA Darts"},
+            }))
+            self.send_slot(key)
         if self.last_score is not None:
             self.publish_score()
 
@@ -105,8 +118,21 @@ class DartEntities:
             LOGGER.warning("MQTT: failed to queue %s (code %s)", topic, result.rc)
         return result
 
-    def update_throw(self, points):
+    def send_slot(self, key):
+        self.send(f"{BASE}/sensor/{key}", self.turn_scores.get(key, "None"))
+
+    def reset_turn(self):
+        with self.lock:
+            self.turn_scores.clear()
+            if self.client.is_connected():
+                for key in PIL_KEYS:
+                    self.send_slot(key)
+
+    def update_throw(self, points, number):
         with self.lock:
             self.last_score = str(points)
+            key = PIL_KEYS[number - 1]
+            self.turn_scores[key] = self.last_score
             if self.client.is_connected():
+                self.send_slot(key)
                 self.publish_score()

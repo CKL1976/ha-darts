@@ -27,10 +27,15 @@ Angiv brokerens adresse i `mqtt_host` samt port og eventuelt login under
 appens Konfiguration. MQTT-integrationen i Home Assistant skal være på den
 samme broker og bruge samme discovery-prefix. Lad `mqtt_host` stå tom for
 at køre appen uden MQTT. Forbindelsesstatus vises i appens webvisning.
-Den eneste MQTT-entitet er `sensor.ha_darts_seneste_kast`. Den viser
-point for den senest godkendte pil, fx 60 for T20. Tidligere HA Darts-entiteter
-fjernes via MQTT Discovery, når appen forbinder til samme broker og prefix.
-MQTT-emnet er `ha_darts/sensor/seneste_kast`.
+Enheden HA Darts har fire MQTT-sensorer:
+
+- `sensor.ha_darts_seneste_kast` viser point for det seneste godkendte kast.
+- `sensor.ha_darts_pil_1`, `sensor.ha_darts_pil_2` og `sensor.ha_darts_pil_3`
+  viser point for hvert godkendt kast i turen. De nulstilles til ukendt ved
+  næste tur og viser først et tal, når den pågældende pil er registreret.
+
+De tidligere billed-, antal- og totalsensorer fjernes via MQTT Discovery
+ved forbindelse til samme broker og discovery-prefix.
 
 ## Livekameraer
 

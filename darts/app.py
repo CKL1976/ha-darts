@@ -275,6 +275,8 @@ def analyze_frames(frames):
             reference = frames
             if darts:
                 darts.clear()
+                if entities:
+                    entities.reset_turn()
             status = "Klar. Kast en pil."
         return
 
@@ -296,7 +298,7 @@ def analyze_frames(frames):
     pending = None
     status = "Tur slut. Fjern pilene." if len(darts) == 3 else "Klar til næste pil."
     if entities:
-        entities.update_throw(hit["points"])
+        entities.update_throw(hit["points"], len(darts))
 
 
 def watch_board():
@@ -467,6 +469,8 @@ def act(action):
         pending = None
         clear_frames = 0
         darts.clear()
+        if entities:
+            entities.reset_turn()
         return turn_state()
 
 
