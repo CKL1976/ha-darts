@@ -22,7 +22,7 @@ canvas{display:block;width:100%;height:auto;cursor:crosshair;margin-bottom:14px}
 <div>
 <button id="reset">Start tur med tom skive</button>
 <button id="autoCalibrate">Auto-kalibrér tom skive</button>
-<button id="calibrate">Kalibrér</button>
+<button id="calibrate">Detaljeret kalibrering</button>
 <button id="refresh">Hent billeder</button>
 </div>
 <p>MQTT: <span id="mqtt">Henter status</span></p>
@@ -59,13 +59,24 @@ const completed = () => points && sides.every(side => points[side].length === la
 const stepIndex = () => Math.min(...sides.map(side => points[side].length));
 const board = {{ board | tojson }};
 const wires = ["5/20", "13/6", "17/3", "8/11"];
-const labels = [
+const standardLabels = [
   ...wires.map(wire => "Inderste dobbeltwire " + wire),
   ...wires.map(wire => "Yderste tripelwire " + wire),
   "Midten af bull"
 ];
-for (const [index, label] of labels.entries()) {
-  get("editPoint").add(new Option(label, index));
+const ringNames = ["Indre bullkant", "Ydre bullkant", "Inderste tripelwire",
+  "Yderste tripelwire", "Inderste dobbeltwire", "Yderste dobbeltwire"];
+const detailedLabels = ["Midten af bull", ...ringNames.flatMap((ring, index) =>
+  board.sectors.map((number, sector) => {
+    const previous = (sector + board.sectors.length - 1) % board.sectors.length;
+    const boundary = board.sectors[previous] + "/" + number;
+    return ring + " ved sektorgrænsen " + boundary +
+      (index < 2 ? " (forlæng wirelinjen mod centrum)" : "");
+  }))];
+let labels = standardLabels;
+function setLabels(next) {
+  labels = next;
+  get("editPoint").replaceChildren(...labels.map((label, index) => new Option(label, index)));
 }
 let editing = null;
 let points = null, busy = false;
@@ -83,7 +94,7 @@ function controls() {
   get("refresh").disabled = busy || !!points;
   get("calibrate").disabled = busy;
   get("autoCalibrate").disabled = busy || !!points;
-  get("calibrate").textContent = points ? "Afbryd kalibrering" : "Kalibrér";
+  get("calibrate").textContent = points ? "Afbryd kalibrering" : "Detaljeret kalibrering";
 }
 async function refresh() {
   await Promise.all(sides.map(side => new Promise((resolve, reject) => {
@@ -211,6 +222,7 @@ get("autoCalibrate").onclick = () => run(async () => {
     image.onerror = () => reject(Error("Kunne ikke vise kalibreringsbilledet."));
     image.src = "data:image/jpeg;base64," + data.images[side];
   })));
+  setLabels(standardLabels);
   points = data.points;
   await previewCalibration(true);
 });
@@ -220,6 +232,7 @@ get("calibrate").onclick = () => run(async () => {
   hideOverlay();
   get("status").textContent = "";
   if (points) {
+    setLabels(detailedLabels);
     await refresh();
     prompt();
   }
@@ -240,6 +253,12 @@ for (const side of sides) get(side).onclick = event => {
   };
   get("zoomTitle").textContent = labels[editing?.index ?? points[side].length] + " · " +
     cameraNames[side];
+  if (editing) {
+    const [oldX, oldY] = points[side][editing.index];
+    if (oldX >= zoom.x && oldX < zoom.x + size && oldY >= zoom.y && oldY < zoom.y + size) {
+      zoom.selected = [(oldX - zoom.x) / size, (oldY - zoom.y) / size];
+    }
+  }
   drawCrop();
   get("zoom").showModal();
 };
@@ -323,7 +342,7 @@ async function previewCalibration(automatic = false) {
   }
   overlayReady = true;
   const worst = side => Math.max(...data.errors[side]).toFixed(1);
-  get("status").textContent = "Sammenlign de blå wirer og tal med skiven. Største afvigelse: venstre " +
+  get("status").textContent = "Sammenlign de blå wirer og tal med skiven. Største afvigelse: " +
     sides.map(side => cameraNames[side] + " " + worst(side) + " px").join(", ") + ".";
   if (automatic) get("status").textContent = "Automatisk forslag. Kontrollér de blå wirer og tal, før du gemmer.";
   const combined = labels.map((_, index) => Math.max(...sides.map(side => data.errors[side][index])));

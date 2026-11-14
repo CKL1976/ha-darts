@@ -11,6 +11,7 @@ import cv2
 import numpy as np
 from flask import Flask, Response, abort, render_template, request
 from waitress import serve
+from scipy.interpolate import LinearNDInterpolator
 
 from camera import CameraFeed, RtspFeed
 from mqtt_entities import DartEntities
@@ -68,10 +69,21 @@ def board_points(indices, radius, offset=0):
     return (radius * np.column_stack((np.sin(angles), -np.cos(angles)))).astype(np.float32)
 
 
+mesh_radii = (bull_inner, bull_outer, treble_inner, treble_outer, double_inner, double_outer)
+mesh_count = 1 + len(sectors) * len(mesh_radii)
+
+
 def calibration_geometry(points, radius):
     source = np.asarray(points, dtype=np.float32)
-    if source.shape not in ((4, 2), (9, 2)) or not np.isfinite(source).all():
+    if source.shape not in ((4, 2), (9, 2), (mesh_count, 2)) or not np.isfinite(source).all():
         raise ValueError("Ugyldige kalibreringspunkter.")
+    if len(source) == mesh_count:
+        if len(np.unique(source, axis=0)) != mesh_count:
+            raise ValueError("To kalibreringspunkter ligger samme sted.")
+        return source, np.vstack(([0, 0], *[
+            board_points(range(len(sectors)), ring, -sector_angle / 2)
+            for ring in mesh_radii
+        ])).astype(np.float32)
     if not cv2.isContourConvex(source[:4]) or cv2.contourArea(source[:4]) < 100:
         raise ValueError("De fire punkter på dobbeltringen ligger forkert.")
     indices = [sectors.index(sector) for sector in anchor_sectors]
@@ -90,7 +102,46 @@ def transform(points, radius=double_outer):
     inverse, _ = cv2.findHomography(target, source, method=0)
     if inverse is None or not np.isfinite(inverse).all():
         raise ValueError("Kunne ikke tilpasse kalibreringen.")
-    return np.linalg.inv(inverse)
+    forward = np.linalg.inv(inverse)
+    if len(source) == mesh_count:
+        return CalibrationMesh(source, target, forward, inverse)
+    return forward
+
+
+class CalibrationMesh:
+    def __init__(self, source, target, forward, inverse):
+        try:
+            self.forward = LinearNDInterpolator(source, target)
+            self.inverse = LinearNDInterpolator(target, source)
+        except ValueError as exc:
+            raise ValueError("Kalibreringspunkterne danner ikke en gyldig skive.") from exc
+        self.fallback = (forward, inverse)
+        # Reject swapped wire points or a folded local mapping.
+        triangles = self.inverse.tri.simplices
+        def orientation(points):
+            a, b, c = points[triangles].transpose(1, 0, 2)
+            u, v = b - a, c - a
+            return u[:, 0] * v[:, 1] - u[:, 1] * v[:, 0]
+        signs = orientation(source) * orientation(target)
+        if not (np.all(signs > 0) or np.all(signs < 0)):
+            raise ValueError("Nogle wirepunkter er byttet om. Kontrollér rækkefølgen.")
+
+    def project(self, points, backwards):
+        interpolate = self.inverse if backwards else self.forward
+        result = interpolate(points)
+        outside = ~np.isfinite(result).all(axis=-1)
+        if outside.any():
+            result[outside] = cv2.perspectiveTransform(
+                points[outside].reshape(1, -1, 2), self.fallback[backwards]
+            )[0]
+        return result.astype(np.float32)
+
+
+def project(points, mapping, backwards=False):
+    if isinstance(mapping, CalibrationMesh):
+        return mapping.project(points, backwards)
+    matrix = np.linalg.inv(mapping) if backwards else mapping
+    return cv2.perspectiveTransform(points, matrix)
 
 
 def field_at(x, y):
@@ -118,8 +169,7 @@ def axes(mask, transform):
     lengths = np.linalg.norm(segments[:, 1] - segments[:, 0], axis=1)
     result = []
     for index in np.argsort(lengths)[-14:][::-1]:
-        a, b = cv2.perspectiveTransform(segments[index:index+1].astype(np.float32),
-                                        transform)[0]
+        a, b = project(segments[index:index+1].astype(np.float32), transform)[0]
         direction = b - a
         norm = np.linalg.norm(direction)
         if norm > 0.01 and np.isfinite(norm):
@@ -157,7 +207,7 @@ def surface_color(frame, x, y):
 def colors_at(hit, before, inverses):
     colors = []
     for frame, inverse in zip(before, inverses):
-        point = cv2.perspectiveTransform(hit.reshape(1, 1, 2), inverse)[0, 0]
+        point = project(hit.reshape(1, 1, 2), inverse, backwards=True)[0, 0]
         x, y = np.rint(point).astype(int)
         colors.append(surface_color(frame, x, y))
     return colors
@@ -168,7 +218,7 @@ def detect(masks, transforms, diagnostics=None, before=None):
     if diagnostics is not None:
         diagnostics["line_counts"] = [len(view) for view in lines]
 
-    inverses = [np.linalg.inv(transform) for transform in transforms]
+    inverses = transforms
     candidates = {}
     for left, right in combinations(range(len(lines)), 2):
         for a, u, length_a in lines[left]:
@@ -182,7 +232,7 @@ def detect(masks, transforms, diagnostics=None, before=None):
                     continue
                 supporting = set()
                 for index, (mask, inverse) in enumerate(zip(masks, inverses)):
-                    point = cv2.perspectiveTransform(hit.reshape(1, 1, 2), inverse)[0, 0]
+                    point = project(hit.reshape(1, 1, 2), inverse, backwards=True)[0, 0]
                     x, y = np.rint(point).astype(int)
                     if (0 <= x < mask.shape[1] and 0 <= y < mask.shape[0]
                         and mask[max(0, y-10):y+11, max(0, x-10):x+11].any()):
@@ -220,7 +270,7 @@ def center_hit(mask, mapping):
     pixels = contour.reshape(-1, 2)
     bottom = pixels[pixels[:, 1] >= pixels[:, 1].max() - 2]
     tip = np.float32([[np.median(bottom, axis=0)]])
-    hit = cv2.perspectiveTransform(tip, mapping)[0, 0]
+    hit = project(tip, mapping)[0, 0]
     field, points = field_at(*hit)
     if field == "MISS":
         return None
@@ -232,7 +282,7 @@ def validate_center(hit, masks, transforms, board):
     position = np.float32([[[hit["x_mm"], hit["y_mm"]]]])
     cropped_masks = []
     for mask, mapping in zip(masks[:2], transforms[:2]):
-        x, y = np.rint(cv2.perspectiveTransform(position, np.linalg.inv(mapping))[0, 0]).astype(int)
+        x, y = np.rint(project(position, mapping, backwards=True)[0, 0]).astype(int)
         crop = np.zeros_like(mask)
         left, right = max(0, x-110), min(mask.shape[1], x+111)
         top, bottom = max(0, y-110), min(mask.shape[0], y+111)
@@ -280,7 +330,8 @@ def index():
         "index.html", third_camera="third" in cameras,
         board={"sectors": sectors, "bull_inner": bull_inner, "bull_outer": bull_outer,
                "treble_inner": treble_inner, "treble_outer": treble_outer,
-               "double_inner": double_inner, "double_outer": double_outer},
+               "double_inner": double_inner, "double_outer": double_outer,
+               "mesh_radii": mesh_radii},
     )
 
 
@@ -372,6 +423,8 @@ def refine_empty_board(frames):
     for index, frame in enumerate(frames):
         try:
             baseline = manual_mappings[index]
+            if isinstance(baseline, CalibrationMesh):
+                continue
             proposal = refine_calibration(frame, baseline)
             raw = cv2.perspectiveTransform(probes, np.linalg.inv(baseline))
             updated = cv2.perspectiveTransform(raw, proposal)
@@ -469,6 +522,8 @@ def auto_calibrate():
         proposal, images = {}, {}
         for side, frame in zip(cameras, frames):
             initial = transform(saved[side], radius)
+            if isinstance(initial, CalibrationMesh):
+                raise ValueError("Detaljeret kalibrering rettes punkt for punkt i den manuelle guide.")
             try:
                 fitted = refine_calibration(frame, initial)
             except ValueError as exc:
@@ -498,21 +553,21 @@ def calibration_preview():
                                 double_inner, double_outer)]
         inside = board_points(range(len(sectors)), bull_outer, -sector_angle / 2)
         outside = board_points(range(len(sectors)), double_outer, -sector_angle / 2)
-        spokes = [np.stack((a, b)) for a, b in zip(inside, outside)]
+        spokes = [np.linspace(a, b, 51, dtype=np.float32) for a, b in zip(inside, outside)]
         number_positions = board_points(range(len(sectors)), double_outer + 13)
         labels = {}
         overlay = {}
         errors = {}
         for side in cameras:
-            inverse = np.linalg.inv(transform(data[side], radius=double_inner))
+            mapping = transform(data[side], radius=double_inner)
             source, target = calibration_geometry(data[side], double_inner)
-            projected = cv2.perspectiveTransform(target[None], inverse)[0]
+            projected = project(target[None], mapping, backwards=True)[0]
             errors[side] = np.round(np.linalg.norm(projected - source, axis=1), 1).tolist()
             overlay[side] = [
-                cv2.perspectiveTransform(line[None], inverse)[0].tolist()
+                project(line[None], mapping, backwards=True)[0].tolist()
                 for line in rings + spokes
             ]
-            labels[side] = cv2.perspectiveTransform(number_positions[None], inverse)[0].tolist()
+            labels[side] = project(number_positions[None], mapping, backwards=True)[0].tolist()
         return {**overlay, "errors": errors, "numbers": sectors,
                 "labels": labels}
     except (KeyError, TypeError, ValueError, cv2.error, np.linalg.LinAlgError) as exc:

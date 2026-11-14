@@ -73,3 +73,12 @@ Center Cam vises i appen som løbende opdaterede billeder uden lyd.
 Når Center Cam er konfigureret, skal alle tre kameraer kalibreres manuelt
 én gang. Alle tre indgår derefter i auto-kalibrering og kastdetektion.
 Skiven og alle ni kalibreringspunkter skal være synlige i RTSP-billedet.
+
+## Detaljeret kalibrering
+
+Vælg **Detaljeret kalibrering**, og markér bullens centrum og de 20
+sektorgrænser på hver af de seks ringkanter i hvert kamerabillede.
+Ved bull forlænges sektorlinjen visuelt til ringkanten. Appen bruger
+punkterne til lokale korrektioner. Kontrollér overlejringen og ret de
+ønskede punkter, før du gemmer. Automatisk finjustering anvendes kun
+på den ældre kalibrering med fire eller ni punkter.
