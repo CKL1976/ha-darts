@@ -224,15 +224,12 @@ def center_hit(mask, mapping):
     contours, _ = cv2.findContours(clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     candidates = []
     for contour in contours:
-        area = cv2.contourArea(contour)
-        short, long = sorted(cv2.minAreaRect(contour)[1])
-        if area >= 80 and short >= 2 and long >= 20 and long / short >= 2.2:
-            if short <= 24 and long <= .45 * max(mask.shape):
-                candidates.append((long, contour))
-    for _, contour in sorted(candidates, key=lambda item: item[0], reverse=True):
-        tip = barrel_tip(contour, mask)
-        if tip is None:
+        if cv2.contourArea(contour) < 80:
             continue
+        evidence = barrel_tip(contour, mask)
+        if evidence is not None:
+            candidates.append(evidence)
+    for _, tip in sorted(candidates, key=lambda item: item[0], reverse=True):
         hit = project(tip, mapping)[0, 0]
         field, points = field_at(*hit)
         if field != "MISS":
@@ -243,31 +240,43 @@ def center_hit(mask, mapping):
 
 
 def barrel_tip(contour, mask):
-    _, _, _, height = cv2.boundingRect(contour)
-    pixels = contour.reshape(-1, 2)
-    edge_y = int(pixels[:, 1].max())
-    # Fit the lower barrel only: the flights and upper shaft can pull
-    # a whole-contour fit away from the line of the steel point.
-    lower = pixels[(pixels[:, 1] >= edge_y - max(12, height // 3))
-                   & (pixels[:, 1] < edge_y - 2)]
-    rows = np.unique(lower[:, 1])
-    if len(rows) < 6:
+    x, y, width, height = cv2.boundingRect(contour)
+    if height < 20 or max(width, height) > .45 * max(mask.shape):
         return None
-    centers = np.array([np.median(lower[lower[:, 1] == row, 0]) for row in rows])
+    silhouette = np.zeros((height, width), np.uint8)
+    cv2.drawContours(silhouette, [contour], -1, 1, cv2.FILLED, offset=(-x, -y))
+    widths = silhouette.sum(axis=1)
+    edge_y = y + height - 1
+    # A barrel has a sustained, nearly parallel pair of sides before the
+    # point. Fit a short lower window so the widest part can include a flight.
+    length = min(36, max(14, height // 3))
+    start = height - length - 3
+    if start < 0:
+        return None
+    local_rows = np.arange(start, height - 3)
+    band = widths[local_rows]
+    barrel_width = float(np.median(band))
+    if not 5 <= barrel_width <= 30 or length < 1.4 * barrel_width:
+        return None
+    if np.mean(np.abs(band - barrel_width) <= max(2, .25 * barrel_width)) < .8:
+        return None
+    centers = np.array([x + np.mean(np.flatnonzero(silhouette[row])) for row in local_rows])
+    rows = local_rows + y
     slope, intercept = np.polyfit(rows, centers, 1)
-    if abs(slope) > 2.5:
+    if abs(slope) > 2.5 or np.max(np.abs(centers - (slope * rows + intercept))) > 2.5:
         return None
 
     # The point may disappear against dark sisal for a few rows. Bridge
     # short gaps but require a narrow, aligned continuation of the barrel.
     hits = []
+    half_width = max(4, math.ceil(barrel_width / 2) + 2)
     for row in range(edge_y + 1, min(mask.shape[0], edge_y + max(12, min(48, height // 3)))):
         expected = round(slope * row + intercept)
-        left, right = max(0, expected - 5), min(mask.shape[1], expected + 6)
+        left, right = max(0, expected - half_width), min(mask.shape[1], expected + half_width + 1)
         if left >= right:
             break
         columns = np.flatnonzero(mask[row, left:right])
-        if 0 < len(columns) <= 7:
+        if 0 < len(columns) <= max(2, .55 * barrel_width):
             center = left + np.median(columns)
             if abs(center - expected) <= 3:
                 hits.append((center, row))
@@ -278,7 +287,7 @@ def barrel_tip(contour, mask):
     if len(hits) < 4:
         return None
     row = hits[-1][1]
-    return np.float32([[[slope * row + intercept, row]]])
+    return length + len(hits), np.float32([[[slope * row + intercept, row]]])
 
 
 def validate_center(hit, masks, transforms):
