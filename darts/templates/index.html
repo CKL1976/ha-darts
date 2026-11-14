@@ -23,7 +23,7 @@ canvas{display:block;width:100%;height:auto;cursor:crosshair;margin-bottom:14px}
 <p><strong id="score">0 point</strong> <span id="throws"></span></p>
 <div>
 <button id="reset">Start tur med tom skive</button>
-<button id="autoCalibrate">Auto-kalibrér tom skive</button>
+<button id="autoCalibrate">1-touch kalibrering</button>
 <button id="calibrate">Detaljeret kalibrering</button>
 <button id="refresh">Hent billeder</button>
 </div>
@@ -267,9 +267,11 @@ get("autoCalibrate").onclick = () => run(async () => {
     image.onerror = () => reject(Error("Kunne ikke vise kalibreringsbilledet."));
     image.src = "data:image/jpeg;base64," + data.images[side];
   })));
-  setLabels(standardLabels);
+  setLabels(data.points.left.length === detailedLabels.length ? detailedLabels : standardLabels);
   points = data.points;
   await previewCalibration(true);
+  const warnings = Object.values(data.warnings ?? {});
+  if (warnings.length) get("status").textContent += " " + warnings.join(" ");
 });
 get("calibrate").onclick = () => run(async () => {
   points = points ? null : Object.fromEntries(sides.map(side => [side, []]));

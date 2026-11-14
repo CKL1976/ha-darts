@@ -493,13 +493,12 @@ def refine_calibration(frame, initial):
     indices = np.arange(0, len(sectors), .25)
     directions = board_points(indices, 1)
     offsets = np.arange(-6, 6.5, .5)
-    inverse = np.linalg.inv(initial)
+    detailed = isinstance(initial, CalibrationMesh)
     observed, targets = [], []
     for radius, sign in ((double_inner, 1), (double_outer, -1),
                          (treble_inner, 1), (treble_outer, -1)):
         polar = directions[:, None, :] * (radius + offsets[None, :, None])
-        xy = cv2.perspectiveTransform(polar.astype(np.float32).reshape(1, -1, 2),
-                                      inverse).reshape(polar.shape)
+        xy = project(polar.astype(np.float32).reshape(1, -1, 2), initial, backwards=True).reshape(polar.shape)
         signal = cv2.remap(chroma, xy[:, :, 0].copy(), xy[:, :, 1].copy(),
                            cv2.INTER_LINEAR)
         # Compare averaged samples on each side of the expected transition.
@@ -510,8 +509,8 @@ def refine_calibration(frame, initial):
         if any(group.sum() < 3 for group in np.array_split(good, 4)):
             raise ValueError("Ringkanten er for utydelig i en del af billedet.")
         found = directions[good] * (radius + offsets[peaks[good] + 2])[:, None]
-        raw = cv2.perspectiveTransform(found.astype(np.float32)[None], inverse)[0]
-        observed.extend(raw)
+        samples = found if detailed else project(found.astype(np.float32)[None], initial, backwards=True)[0]
+        observed.extend(samples)
         targets.extend(directions[good] * radius)
 
     observed = np.float32(observed)
@@ -525,7 +524,8 @@ def refine_calibration(frame, initial):
         # Evaluate both fits against the same samples from every ring and quadrant.
         return np.mean(np.minimum(np.linalg.norm(predicted - targets, axis=1), 4))
 
-    return fitted if error(fitted) + .1 < error(initial) else initial
+    baseline = np.eye(3) if detailed else initial
+    return fitted if error(fitted) + .1 < error(baseline) else baseline
 
 
 @app.post("/auto-calibrate")
@@ -539,27 +539,39 @@ def auto_calibrate():
         if any(side not in saved for side in cameras):
             raise ValueError("Kalibrér alle tilsluttede kameraer manuelt én gang først.")
         radius = double_inner if saved and saved.get("ring") == "inner_double" else double_outer
-        proposal, images = {}, {}
+        proposal, images, warnings = {}, {}, {}
         for side, frame in zip(cameras, frames):
             initial = transform(saved[side], radius)
-            if isinstance(initial, CalibrationMesh):
-                raise ValueError("Detaljeret kalibrering rettes punkt for punkt i den manuelle guide.")
+            detailed = isinstance(initial, CalibrationMesh)
             try:
                 fitted = refine_calibration(frame, initial)
             except ValueError as exc:
                 name = {"left": "Venstre kamera", "right": "Højre kamera", "third": "Center Cam"}[side]
-                raise ValueError(f"{name}: {exc}") from exc
+                warnings[side] = f"{name}: {exc}"
+                fitted = np.eye(3) if detailed else initial
             anchors = np.vstack((
                 board_points([sectors.index(n) for n in anchor_sectors], double_inner, -sector_angle / 2),
                 board_points([sectors.index(n) for n in anchor_sectors], treble_outer, -sector_angle / 2),
                 [[0, 0]],
             )).astype(np.float32)
-            proposal[side] = cv2.perspectiveTransform(anchors[None], np.linalg.inv(fitted))[0].tolist()
+            if detailed:
+                source, target = calibration_geometry(saved[side], radius)
+                adjusted = project(target[None], fitted, backwards=True)[0]
+                # Apply the fitted shift locally while preserving the manual mesh.
+                shifted = project(adjusted[None], initial, backwards=True)[0]
+                proposal[side] = (source + shifted - project(target[None], initial, backwards=True)[0]).tolist()
+                try:
+                    transform(proposal[side], double_inner)
+                except (ValueError, cv2.error, np.linalg.LinAlgError):
+                    warnings[side] = "Automatisk justering blev afvist for dette kamera."
+                    proposal[side] = saved[side]
+            else:
+                proposal[side] = project(anchors[None], fitted, backwards=True)[0].tolist()
             ok, jpeg = cv2.imencode(".jpg", frame)
             if not ok:
                 raise ValueError("Kunne ikke vise kalibreringsbilledet.")
             images[side] = base64.b64encode(jpeg.tobytes()).decode("ascii")
-        return {"points": proposal, "images": images}
+        return {"points": proposal, "images": images, "warnings": warnings}
     except (OSError, ValueError, KeyError, TypeError, cv2.error, np.linalg.LinAlgError) as exc:
         return {"error": str(exc)}, 400
 
