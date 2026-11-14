@@ -519,7 +519,7 @@ def refine_calibration(frame, initial):
     return fitted if error(fitted) + .1 < error(baseline) else baseline
 
 
-def wire_profiles(gray, mapping, points, normals):
+def wire_profiles(gray, mapping, points, normals, spoke_start):
     # A steel wire is a narrow ridge or groove with two shoulders. A single
     # brightness step at the edge of a colored segment has only one shoulder.
     offsets = np.arange(-4, 4.25, .25, dtype=np.float32)
@@ -531,6 +531,13 @@ def wire_profiles(gray, mapping, points, normals):
     left = center - signal[:, :-8]
     right = center - signal[:, 8:]
     contrast = np.maximum(np.minimum(left, right), .75 * np.minimum(-left, -right))
+    # The blade between black and white sisal can have an intermediate
+    # brightness. In that case its center is between two same-sign edges.
+    step = np.minimum(np.abs(left), np.abs(right))
+    contrast[spoke_start:] = np.maximum(
+        contrast[spoke_start:],
+        np.where((left * right)[spoke_start:] < 0, .65 * step[spoke_start:], 0),
+    )
     peak = (contrast - 1.8 * np.abs(offsets[4:-4])).argmax(axis=1)
     rows = np.arange(len(points))
     strength = contrast[rows, peak]
@@ -539,6 +546,58 @@ def wire_profiles(gray, mapping, points, normals):
     good &= ((pixels[:, :, 0] >= 1) & (pixels[:, :, 0] < gray.shape[1] - 1)
              & (pixels[:, :, 1] >= 1) & (pixels[:, :, 1] < gray.shape[0] - 1)).all(axis=1)
     return displacement, good
+
+
+def fit_wire_offsets(points, normals, shifts, spread):
+    points = points.astype(np.float64)
+
+    def shifted(samples, parameters):
+        matrix = np.eye(3) + np.r_[parameters, 0].reshape(3, 3)
+        return cv2.perspectiveTransform(
+            (samples / double_outer)[None], matrix
+        )[0] * double_outer
+
+    def residual(parameters):
+        return np.sum((shifted(points, parameters) - points) * normals, axis=1) - shifts
+
+    fit = least_squares(residual, np.zeros(8), loss="soft_l1", f_scale=spread,
+                        bounds=(-.16, .16))
+    return fit.fun, lambda samples: shifted(samples, fit.x)
+
+
+def align_ring_bands(frame, initial, directions, target):
+    # Locate both edges of each scoring band together before looking for
+    # the thin wire. The paired edges distinguish the ring from board texture.
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    hue, saturation, value = hsv.transpose(2, 0, 1)
+    colored = ((hue <= 12) | (hue >= 168) | ((hue >= 36) & (hue <= 95))) & (value >= 35)
+    chroma = np.where(colored, saturation, 0).astype(np.float32)
+    offsets = np.arange(-13, 13.5, .5, dtype=np.float32)
+    points, normals, shifts = [], [], []
+    for inner, outer in ((treble_inner, treble_outer), (double_inner, double_outer)):
+        profiles = []
+        for radius in (inner, outer):
+            probes = directions[:, None, :] * (radius + offsets[None, :, None])
+            pixels = project(probes.reshape(1, -1, 2), initial, backwards=True).reshape(probes.shape)
+            signal = cv2.remap(chroma, pixels[:, :, 0].copy(), pixels[:, :, 1].copy(),
+                               cv2.INTER_LINEAR)
+            profiles.append(signal[:, 4:] - signal[:, :-4])
+        strength = np.minimum(profiles[0], -profiles[1])
+        peaks = (strength - .7 * np.abs(offsets[2:-2])).argmax(axis=1)
+        good = strength[np.arange(len(peaks)), peaks] >= 20
+        if any(group.sum() < 7 for group in np.array_split(good, 4)):
+            return initial
+        points.extend(directions[good] * ((inner + outer) / 2))
+        normals.extend(directions[good])
+        shifts.extend(offsets[peaks[good] + 2])
+    residual, adjust = fit_wire_offsets(np.asarray(points), np.asarray(normals), shifts, 1.3)
+    if np.median(np.abs(residual)) > 2 or np.median(np.abs(residual)) + .25 >= np.median(np.abs(shifts)):
+        return initial
+    anchors = project(adjust(target).astype(np.float32)[None], initial, backwards=True)[0]
+    try:
+        return transform(anchors)
+    except (ValueError, cv2.error, np.linalg.LinAlgError):
+        return initial
 
 
 def fit_steel_wires(frame, initial):
@@ -557,7 +616,16 @@ def fit_steel_wires(frame, initial):
     samples = np.vstack((ring_points, spoke_points)).astype(np.float32)
     normals = np.vstack((np.tile(ring_directions, (len(mesh_radii), 1)),
                          np.repeat(tangents, len(spoke_radii), axis=0)))
-    matching, good = wire_profiles(gray, initial, samples, normals)
+    target = np.vstack(([[0, 0]], *[spokes * radius for radius in mesh_radii]))
+    initial = align_ring_bands(frame, initial, ring_directions, target)
+    start = len(ring_points)
+    matching, good = wire_profiles(gray, initial, samples, normals, start)
+    # Require nearby samples on the same physical spoke to agree before
+    # trusting a ridge. Isolated ridges in sisal often look like wire.
+    spoke_shifts = matching[start:].reshape(len(sectors), -1)
+    spoke_mask = good[start:].reshape(spoke_shifts.shape)
+    neighbors = (np.abs(spoke_shifts[:, :, None] - spoke_shifts[:, None, :]) <= 1.5)
+    spoke_mask &= (neighbors & spoke_mask[:, None, :]).sum(axis=2) >= 3
     ring_good = good[:len(ring_points)].reshape(len(mesh_radii), len(sectors), -1)
     spoke_good = good[len(ring_points):].reshape(len(sectors), -1)
     for quadrant in range(4):
@@ -566,33 +634,15 @@ def fit_steel_wires(frame, initial):
                 or (spoke_good[group].sum(axis=1) >= 3).sum() < 2):
             raise ValueError("Stålwirerne kunne ikke genkendes rundt om hele skiven.")
 
-    sample_points = samples[good].astype(np.float64)
-    sample_normals = normals[good]
-    shifts = matching[good]
-
-    def matrix(parameters):
-        return np.eye(3) + np.r_[parameters, 0].reshape(3, 3)
-
-    def shifted(points, parameters):
-        return cv2.perspectiveTransform(
-            (points / double_outer)[None], matrix(parameters)
-        )[0] * double_outer
-
-    def residual(parameters):
-        moved = shifted(sample_points, parameters)
-        return np.sum((moved - sample_points) * sample_normals, axis=1) - shifts
-
-    fit = least_squares(residual, np.zeros(8), loss="soft_l1", f_scale=.55,
-                        bounds=(-.05, .05))
-    if np.median(np.abs(fit.fun)) > 1.15:
+    residual, adjust = fit_wire_offsets(samples[good], normals[good], matching[good], .7)
+    if np.median(np.abs(residual)) > 1.15:
         raise ValueError("Fundne stålwirer stemmer ikke overens.")
 
-    target = np.vstack(([[0, 0]], *[spokes * radius for radius in mesh_radii]))
-    adjusted = shifted(target, fit.x)
+    adjusted = adjust(target)
     # Correct residual lens distortion around each intersection using its
     # neighboring ring arcs and the nearby length of the same spoke.
     remaining = np.full(len(samples), np.nan)
-    remaining[good] = -fit.fun
+    remaining[good] = -residual
     ring_residual = remaining[:len(ring_points)].reshape(len(mesh_radii), len(sectors), -1)
     spoke_residual = remaining[len(ring_points):].reshape(len(sectors), -1)
     for ring, radius in enumerate(mesh_radii):
@@ -629,19 +679,14 @@ def auto_calibrate():
             except (ValueError, cv2.error, np.linalg.LinAlgError) as exc:
                 name = {"left": "Venstre kamera", "right": "Højre kamera"}[side]
                 warnings[side] = f"{name}: {exc}"
-                if isinstance(initial, CalibrationMesh):
-                    proposal[side] = saved[side]
-                else:
-                    anchors = np.vstack(([[0, 0]], *[
-                        board_points(range(len(sectors)), ring, -sector_angle / 2)
-                        for ring in mesh_radii
-                    ])).astype(np.float32)
-                    proposal[side] = project(anchors[None], initial, backwards=True)[0].tolist()
+                continue
             ok, jpeg = cv2.imencode(".jpg", frame)
             if not ok:
                 raise ValueError("Kunne ikke vise kalibreringsbilledet.")
             images[side] = base64.b64encode(jpeg.tobytes()).decode("ascii")
-        return {"points": proposal, "images": images, "warnings": warnings}
+        if warnings:
+            return {"error": " ".join(warnings.values())}, 422
+        return {"points": proposal, "images": images}
     except (OSError, ValueError, KeyError, TypeError, cv2.error, np.linalg.LinAlgError) as exc:
         return {"error": str(exc)}, 400
 

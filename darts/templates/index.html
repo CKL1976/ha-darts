@@ -319,8 +319,6 @@ get("autoCalibrate").onclick = () => run(async () => {
   setLabels(data.points.left.length === detailedLabels.length ? detailedLabels : standardLabels);
   points = data.points;
   await previewCalibration(true);
-  const warnings = Object.values(data.warnings ?? {});
-  if (warnings.length) get("status").textContent += " " + warnings.join(" ");
 });
 const startCalibration = calibrationLabels => run(async () => {
   points = points ? null : Object.fromEntries(sides.map(side => [side, []]));
