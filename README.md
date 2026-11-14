@@ -1,17 +1,25 @@
 # HA Darts
 
-Home Assistant OS-app til to GRAN EYE-kameraer. Appen henter stillbilleder via
-HTTP og finder den nye pil ud fra forskellen mellem billeder før og efter kastet.
+Home Assistant OS-app, der finder den nye pil ud fra stillbilleder fra
+Home Assistant-kameraentiteter før og efter kastet.
 
 ## Installation
 
 Tilføj dette GitHub-repo under Indstillinger → Apps → App-butik → Repositories.
-Installér HA Darts. Under Konfiguration skal du erstatte eksempeladresserne med dine to kameraers URL'er, inklusive /picture.
-Start appen og åbn webgrænsefladen.
+Installér og start HA Darts, og åbn appens webgrænseflade.
+
+1. Tilføj dine kameraer med **Generic Camera** under Indstillinger → Enheder og
+   tjenester, hvis de ikke allerede findes som kameraentiteter. Brug kameraernes
+   `/picture`-adresse som stillbillede for venstre og højre. Center Cam kan
+   bruge sin RTSP-adresse som streamkilde i Generic Camera.
+2. Åbn **Kameraer** i HA Darts, vælg en entitet til hver rolle, og tryk
+   **Gem kameraer**.
+3. Vælg **Kalibrér 9 punkter** med tom skive efter opgradering fra
+   URL-konfigurationen eller efter ændring af kameraroller.
 
 ## Første tur
 
-1. Tøm skiven, og vælg Kalibrér. Markér de fire kryds på dobbeltringens
+1. Tøm skiven, og vælg **Kalibrér 9 punkter**. Markér de fire kryds på dobbeltringens
    inderste wire, de samme fire sektorgrænser på tripelringens yderste wire
    og centrum af bull. Ret valgfri punkter i zoomvisningen før du gemmer.
 2. Vælg Start tur med tom skive. Ældre kalibreringer bruger stadig den
@@ -37,18 +45,12 @@ Enheden HA Darts har fire MQTT-sensorer:
 De tidligere billed-, antal- og totalsensorer fjernes via MQTT Discovery
 ved forbindelse til samme broker og discovery-prefix.
 
-## Livekameraer
-
-Appen holder en HTTP MJPEG-forbindelse åben pr. kamera og genbruger det
-seneste billede til visning og detektion. Et almindeligt JPEG-endpoint
-hentes løbende. Hvis kameraets MJPEG-feed bruger en anden sti end /picture,
-angiv den i `left_live_url` og `right_live_url`. Kalibrering fryser billederne,
-så krydsene kan markeres på samme billedpar.
-
 ## Kastdetektion
 
-Center Cam søger efter en smal, aflang form og følger dens akse mod
-pilespidsen. Sidekameraerne validerer træffet geometrisk.
+Venstre og højre kamera leverer stillbilleder til automatisk detektion og
+scoring. Center Cam leverer et stillbillede til validering. Home Assistant
+håndterer forbindelserne til kameraerne. Kalibrering fryser billederne,
+så krydsene kan markeres i samme billede.
 
 ## Skivekort
 
@@ -59,18 +61,11 @@ fysiske skive.
 
 ## Automatisk finjustering
 
-Tøm skiven og vælg Auto-kalibrér tom skive. En gemt manuel kalibrering
+Tøm skiven og vælg **1-touch kalibrering**. En gemt manuel kalibrering
 giver startposition og retning. Kontrollér forslaget i begge billeder,
 og gem, hvis overlejringen passer. Kastdetektionen scorer den bedst
 rangerede kandidat, når den bekræftes i to aflæsninger. MQTT-status viser
 brokerens kvittering for pointværdien.
-
-Tilføj eventuelt en RTSP-adresse i `center_cam` i appens konfiguration.
-Center Cam vises i appen som løbende opdaterede billeder uden lyd.
-
-Når Center Cam er konfigureret, skal alle tre kameraer kalibreres manuelt
-én gang. Alle tre indgår derefter i auto-kalibrering og kastdetektion.
-Skiven og alle ni kalibreringspunkter skal være synlige i RTSP-billedet.
 
 ## Detaljeret kalibrering
 

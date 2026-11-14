@@ -1,127 +1,70 @@
-"""Read HTTP JPEG snapshots or a continuous MJPEG response."""
+"""Discover camera entities and fetch snapshots through Home Assistant Core."""
 
+import json
+import os
+import re
 from http.client import HTTPException
-from threading import Condition, Lock, Thread
-from time import monotonic, sleep
+from threading import Lock
+from time import monotonic
 from urllib.error import HTTPError
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
+CORE_API = "http://supervisor/core/api"
 MAX_FRAME = 8_000_000
+CAMERA_ID = re.compile(r"camera\.[a-z0-9_]+")
 
 
-def jpeg_frames(response):
-    content_type = response.headers.get_content_type()
-    if content_type != "multipart/x-mixed-replace":
-        data = response.read(MAX_FRAME + 1)
-        if len(data) > MAX_FRAME or not data.startswith(b"\xff\xd8"):
-            raise ValueError("Kameraet returnerede ikke et gyldigt JPEG-billede.")
-        yield data
-        return
-
-    buffer = bytearray()
-    while chunk := response.read1(65536):
-        buffer.extend(chunk)
-        while True:
-            start = buffer.find(b"\xff\xd8")
-            if start < 0:
-                del buffer[:-1]
-                break
-            del buffer[:start]
-            end = buffer.find(b"\xff\xd9", 2)
-            if end < 0:
-                if len(buffer) > MAX_FRAME:
-                    raise ValueError("Kamerabilledet er for stort.")
-                break
-            if end + 2 > MAX_FRAME:
-                raise ValueError("Kamerabilledet er for stort.")
-            yield bytes(buffer[:end + 2])
-            del buffer[:end + 2]
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 
-class SnapshotCamera:
-    def __init__(self, url):
-        self.url = url
+opener = build_opener(NoRedirect())
+
+
+def core_get(path, timeout):
+    token = os.environ.get("SUPERVISOR_TOKEN")
+    if not token:
+        raise ValueError("Supervisor-token mangler. Start HA Darts som en Home Assistant-app.")
+    request = Request(CORE_API + path, headers={"Authorization": f"Bearer {token}"})
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            data = response.read(MAX_FRAME + 1)
+    except HTTPError as exc:
+        exc.close()
+        raise ValueError(f"Home Assistant svarede HTTP {exc.code}.") from exc
+    except (OSError, HTTPException) as exc:
+        raise ValueError("Home Assistant returnerede ikke et svar i tide.") from exc
+    if len(data) > MAX_FRAME:
+        raise ValueError("Svaret fra Home Assistant er for stort.")
+    return data
+
+
+def camera_entities():
+    states = json.loads(core_get("/states", timeout=5))
+    entities = [
+        {"id": state["entity_id"], "name": state["attributes"].get("friendly_name") or state["entity_id"],
+         "available": state["state"] != "unavailable"}
+        for state in states if CAMERA_ID.fullmatch(state["entity_id"])
+    ]
+    return sorted(entities, key=lambda camera: (camera["name"].casefold(), camera["id"]))
+
+
+class EntityCamera:
+    def __init__(self, entity_id):
+        if not CAMERA_ID.fullmatch(entity_id):
+            raise ValueError("Ugyldigt kamera-id.")
+        self.entity_id = entity_id
         self.lock = Lock()
-
-    def latest(self, newer_than=0.0, timeout=5):
-        with self.lock:
-            try:
-                with urlopen(Request(self.url, headers={"Connection": "close"}), timeout=4) as response:
-                    frame = next(jpeg_frames(response), None)
-            except HTTPError as exc:
-                exc.close()
-                raise ValueError(f"Kameraet svarede HTTP {exc.code}.") from exc
-            except HTTPException as exc:
-                raise ValueError("Kameraet returnerede et ufuldstændigt svar.") from exc
-            if frame is None:
-                raise ValueError("Kameraet returnerede ikke et billede.")
-            return frame, monotonic()
-
-
-class CameraFeed:
-    def __init__(self, url):
-        self.url = url
-        self.condition = Condition()
         self.frame = None
-        self.updated = 0.0
-        self.error = "Venter på kamerabillede."
-        Thread(target=self.watch, daemon=True).start()
+        self.timestamp = 0
 
-    def watch(self):
-        while True:
-            try:
-                with urlopen(self.url, timeout=4) as response:
-                    for frame in jpeg_frames(response):
-                        with self.condition:
-                            self.frame = frame
-                            self.updated = monotonic()
-                            self.condition.notify_all()
-            except HTTPError as exc:
-                exc.close()
-                self.error = f"Kameraet svarede HTTP {exc.code}."
-            except (OSError, ValueError, HTTPException) as exc:
-                self.error = str(exc)
-            sleep(0.8)
-
-    def latest(self, newer_than=0.0, timeout=5):
-        with self.condition:
-            if not self.condition.wait_for(
-                lambda: self.updated > newer_than and monotonic() - self.updated < 3,
-                timeout=timeout,
-            ):
-                raise ValueError(self.error if self.frame is None else "Kamerabilledet opdateres ikke.")
-            return self.frame, self.updated
-
-
-class RtspFeed(CameraFeed):
-    def watch(self):
-        import cv2
-
-        while True:
-            source = cv2.VideoCapture()
-            try:
-                source.open(self.url, cv2.CAP_FFMPEG, [
-                    cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 4000,
-                    cv2.CAP_PROP_READ_TIMEOUT_MSEC, 4000,
-                ])
-                next_preview = 0
-                while source.isOpened():
-                    ok, frame = source.read()
-                    if not ok:
-                        break
-                    now = monotonic()
-                    if now < next_preview:
-                        continue
-                    ok, jpeg = cv2.imencode(".jpg", frame)
-                    if ok:
-                        with self.condition:
-                            self.frame = jpeg.tobytes()
-                            self.updated = now
-                            self.condition.notify_all()
-                    next_preview = now + .2
-                self.error = "RTSP-kameraet leverer ikke billeder. Prøver igen."
-            except cv2.error:
-                self.error = "Kunne ikke læse RTSP-kameraet. Prøver igen."
-            finally:
-                source.release()
-            sleep(1)
+    def snapshot(self, preview=False):
+        with self.lock:
+            if preview and self.frame is not None and monotonic() - self.timestamp < 2:
+                return self.frame
+            # Use still images for all roles. Home Assistant can extract the
+            # still image from the center camera's stream when needed.
+            self.frame = core_get("/camera_proxy/" + self.entity_id, timeout=8)
+            self.timestamp = monotonic()
+            return self.frame

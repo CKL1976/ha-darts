@@ -14,14 +14,15 @@ from waitress import serve
 from scipy.interpolate import LinearNDInterpolator
 from scipy.optimize import least_squares
 
-from camera import RtspFeed, SnapshotCamera
+from camera import CAMERA_ID, EntityCamera, camera_entities
 from mqtt_entities import DartEntities
 
 app = Flask(__name__)
 lock = Lock()
 options_path = Path("/data/options.json")
 calibration_path = Path("/data/calibration.json")
-sides = ("left", "right")
+camera_path = Path("/data/cameras.json")
+camera_roles = ("left", "right", "third")
 sectors = (20, 1, 18, 4, 13, 6, 10, 15, 2, 17, 3, 19, 7, 16, 8, 11, 14, 9, 12, 5)
 sector_angle = 360 / len(sectors)
 bull_inner, bull_outer = 6.35, 15.9
@@ -35,11 +36,11 @@ manual_mappings = None
 next_refinement = 0
 pending = None
 clear_frames = 0
-status = "Start med tom skive."
+status = "Vælg dine tre Home Assistant-kameraer."
 darts = []
 entities = None
 cameras = {}
-last_capture = {}
+
 
 
 @app.before_request
@@ -48,25 +49,23 @@ def ingress_only():
         abort(403)
 
 
-def capture(side, wait_for_new=True):
+def capture(side):
     try:
-        data, timestamp = cameras[side].latest(
-            last_capture.get(side, 0) if wait_for_new else 0,
-            timeout=5 if wait_for_new else 0,
-        )
+        data = cameras[side].snapshot()
         frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
         if frame is None:
             raise ValueError("Kameraet returnerede et ulæseligt billede.")
     except ValueError as exc:
         raise ValueError(f"{side}: {exc}") from exc
-    last_capture[side] = timestamp
     return frame
 
 
 def capture_pair(strict=True):
+    require_cameras()
+
     def capture_view(side):
         try:
-            return capture(side, wait_for_new=strict or side != "third")
+            return capture(side)
         except (ValueError, OSError, cv2.error):
             if strict or side != "third":
                 raise
@@ -364,10 +363,69 @@ def validate_center(hit, before, after, mappings):
             "validation": "confirmed" if confirmed else "disagrees"}
 
 
+def camera_selection():
+    return {role: camera.entity_id for role, camera in cameras.items()}
+
+
+def require_cameras():
+    if not cameras:
+        raise ValueError("Vælg og gem de tre kameraer først.")
+
+
+def saved_calibration():
+    require_cameras()
+    if not calibration_path.exists():
+        raise ValueError("Kalibrér kameraerne først.")
+    saved = json.loads(calibration_path.read_text())
+    if saved.get("camera_entities") != camera_selection():
+        raise ValueError("Vælg Kalibrér 9 punkter for de valgte kameraer først.")
+    return saved
+
+
+@app.get("/cameras")
+def list_cameras():
+    try:
+        return {"entities": camera_entities(), "selected": camera_selection()}, 200, {"Cache-Control": "no-store"}
+    except (OSError, ValueError) as exc:
+        return {"error": str(exc)}, 502
+
+
+@app.post("/cameras")
+def select_cameras():
+    global cameras, reference, empty_board, mappings, manual_mappings, pending, clear_frames, status
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return {"error": "Vælg et kamera til hver rolle."}, 400
+    selected = {role: data.get(role) for role in camera_roles}
+    if any(not isinstance(value, str) or not CAMERA_ID.fullmatch(value) for value in selected.values()):
+        return {"error": "Vælg et kamera til hver rolle."}, 400
+    if len(set(selected.values())) != len(camera_roles):
+        return {"error": "Vælg tre forskellige kameraer."}, 400
+    try:
+        available = {entity["id"] for entity in camera_entities() if entity["available"]}
+        if not set(selected.values()) <= available:
+            return {"error": "Et valgt kamera er utilgængeligt i Home Assistant."}, 400
+        with lock:
+            if selected != camera_selection():
+                temp = camera_path.with_suffix(".tmp")
+                temp.write_text(json.dumps(selected))
+                temp.replace(camera_path)
+                cameras = {role: EntityCamera(entity_id) for role, entity_id in selected.items()}
+                reference = empty_board = mappings = manual_mappings = pending = None
+                clear_frames = 0
+                darts.clear()
+                status = "Kameraer gemt. Kalibrér med tom skive."
+                if entities:
+                    entities.reset_turn()
+        return {"selected": selected}
+    except (OSError, ValueError) as exc:
+        return {"error": str(exc)}, 502
+
+
 @app.get("/")
 def index():
     return render_template(
-        "index.html", third_camera="third" in cameras,
+        "index.html", configured=bool(cameras), selection=camera_selection(),
         board={"sectors": sectors, "bull_inner": bull_inner, "bull_outer": bull_outer,
                "treble_inner": treble_inner, "treble_outer": treble_outer,
                "double_inner": double_inner, "double_outer": double_outer,
@@ -376,12 +434,21 @@ def index():
 
 
 @app.get("/image/<side>")
-def image(side):
-    if side not in cameras:
+def camera_image(side):
+    camera = cameras.get(side)
+    if camera is None:
         abort(404)
     try:
-        jpeg, _ = cameras[side].latest()
-        return Response(jpeg, mimetype="image/jpeg",
+        image = camera.snapshot(preview=True)
+        if not image.startswith(b"\xff\xd8"):
+            frame = cv2.imdecode(np.frombuffer(image, np.uint8), cv2.IMREAD_COLOR)
+            if frame is None:
+                raise ValueError("Kameraet returnerede et ulæseligt billede.")
+            ok, jpeg = cv2.imencode(".jpg", frame)
+            if not ok:
+                raise ValueError("Kunne ikke vise kamerabilledet.")
+            image = jpeg.tobytes()
+        return Response(image, mimetype="image/jpeg",
                         headers={"Cache-Control": "no-store"})
     except (OSError, ValueError, cv2.error) as exc:
         return str(exc), 502
@@ -646,15 +713,12 @@ def fit_steel_wires(frame, initial):
 def auto_calibrate():
     try:
         with lock:
+            saved = saved_calibration()
             frames = capture_pair()
-            saved = json.loads(calibration_path.read_text()) if calibration_path.exists() else None
-        if saved is None:
-            raise ValueError("Gem først en manuel kalibrering, så appen kender skivens retning.")
-        if any(side not in saved for side in cameras):
-            raise ValueError("Kalibrér alle tilsluttede kameraer manuelt én gang først.")
+            captured_roles = tuple(cameras)
         radius = double_inner if saved and saved.get("ring") == "inner_double" else double_outer
         proposal, images, warnings = {}, {}, {}
-        for side, frame in zip(cameras, frames):
+        for side, frame in zip(captured_roles, frames):
             initial = transform(saved[side], radius)
             try:
                 proposal[side] = fit_steel_wires(frame, initial)
@@ -716,22 +780,22 @@ def act(action):
         frames = None
         try:
             if action == "calibrate":
+                require_cameras()
                 data = request.get_json()
+                if not isinstance(data, dict) or data.get("camera_entities") != camera_selection():
+                    raise ValueError("Kameraerne er ændret. Genindlæs appen og kalibrér igen.")
                 points = {side: data[side] for side in cameras}
                 for coordinates in points.values():
                     transform(coordinates, radius=double_inner)
                 temp = calibration_path.with_suffix(".tmp")
-                temp.write_text(json.dumps({**points, "ring": "inner_double"}))
+                temp.write_text(json.dumps({**points, "ring": "inner_double",
+                                            "camera_entities": camera_selection()}))
                 temp.replace(calibration_path)
                 reference = None
                 status = "Kalibrering gemt. Start med tom skive."
             elif action == "reset":
-                if not calibration_path.exists():
-                    raise ValueError("Kalibrér kameraerne først.")
-                points = json.loads(calibration_path.read_text())
+                points = saved_calibration()
                 radius = double_inner if points.get("ring") == "inner_double" else double_outer
-                if any(side not in points for side in cameras):
-                    raise ValueError("Kalibrér alle tilsluttede kameraer først.")
                 new_mappings = [transform(points[side], radius) for side in cameras]
                 frames = capture_pair(strict=False)
                 manual_mappings = new_mappings
@@ -753,11 +817,10 @@ def act(action):
 
 if __name__ == "__main__":
     options = json.loads(options_path.read_text())
-    cameras = {side: SnapshotCamera(options[f"{side}_url"])
-               for side in sides}
-    center_cam_url = options.get("center_cam") or options.get("third_camera_url")
-    if center_cam_url:
-        cameras["third"] = RtspFeed(center_cam_url)
+    if camera_path.exists():
+        selected = json.loads(camera_path.read_text())
+        cameras = {role: EntityCamera(selected[role]) for role in camera_roles}
+        status = "Start med tom skive."
     if options.get("mqtt_host"):
         entities = DartEntities(options)
     Thread(target=watch_board, daemon=True).start()

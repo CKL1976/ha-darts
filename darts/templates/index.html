@@ -20,10 +20,26 @@ canvas{display:block;width:100%;height:auto;cursor:crosshair;margin-bottom:14px}
 #crop{touch-action:none}
 </style>
 <h1>HA Darts</h1>
+<details id="cameraSettings"{% if not configured %} open{% endif %}>
+<summary>Kameraer</summary>
+<form id="cameraForm">
+  <p>Vælg tre kameraer fra Home Assistant.</p>
+  <label for="camera-left">Venstre kamera</label>
+  <select id="camera-left" required></select>
+  <label for="camera-right">Højre kamera</label>
+  <select id="camera-right" required></select>
+  <label for="camera-third">Center Cam</label>
+  <select id="camera-third" required></select>
+  <button id="saveCameras" disabled>Gem kameraer</button>
+  <button type="button" id="reloadCameras">Opdatér liste</button>
+  <output id="cameraStatus" aria-live="polite"></output>
+</form>
+</details>
 <p><strong id="score">0 point</strong> <span id="throws"></span></p>
 <div>
 <button id="reset">Start tur med tom skive</button>
 <button id="autoCalibrate">1-touch kalibrering</button>
+<button id="quickCalibrate">Kalibrér 9 punkter</button>
 <button id="calibrate">Detaljeret kalibrering</button>
 <button id="refresh">Hent billeder</button>
 </div>
@@ -38,9 +54,7 @@ canvas{display:block;width:100%;height:auto;cursor:crosshair;margin-bottom:14px}
 <div class="views">
 <figure><figcaption>Venstre kamera</figcaption><div class="camera-frame"><img id="left" alt="Venstre kamerabillede"><canvas id="leftOverlay" hidden></canvas></div></figure>
 <figure><figcaption>Højre kamera</figcaption><div class="camera-frame"><img id="right" alt="Højre kamerabillede"><canvas id="rightOverlay" hidden></canvas></div></figure>
-{% if third_camera %}
-<figure><figcaption>Center Cam · gult kryds: fundet spids · blå ring: beregnet træf</figcaption><div class="camera-frame"><img id="third" alt="RTSP-kamerabillede"><canvas id="thirdOverlay" hidden></canvas></div></figure>
-{% endif %}
+<figure><figcaption>Center Cam · gult kryds: fundet spids · blå ring: beregnet træf</figcaption><div class="camera-frame"><img id="third" alt="Center Cam-kamerabillede"><canvas id="thirdOverlay" hidden></canvas></div></figure>
 <figure>
   <figcaption>Dartskive · træfpunkter</figcaption>
   <canvas id="dartboard" width="400" height="400" role="img" aria-label="Dartskive uden registrerede pile"></canvas>
@@ -55,8 +69,9 @@ canvas{display:block;width:100%;height:auto;cursor:crosshair;margin-bottom:14px}
 </dialog>
 <script>
 const get = id => document.getElementById(id);
-const sides = ["left", "right"];
-if (get("third")) sides.push("third");
+const sides = ["left", "right", "third"];
+const configured = {{ configured | tojson }};
+const activeSelection = {{ selection | tojson }};
 const cameraNames = {left: "Venstre kamera", right: "Højre kamera", third: "Center Cam"};
 const completed = () => points && sides.every(side => points[side].length === labels.length);
 const stepIndex = () => Math.min(...sides.map(side => points[side].length));
@@ -91,16 +106,68 @@ const cropSize = 120;
 const canvas = get("crop");
 const context = canvas.getContext("2d");
 function controls() {
-  get("reset").disabled = busy || !!points;
+  get("reset").disabled = !configured || busy || !!points;
   const reviewing = editing === null && completed();
   get("review").hidden = !reviewing;
   get("saveCalibration").disabled = busy || !overlayReady;
   get("redoPoint").disabled = busy;
-  get("refresh").disabled = busy || !!points;
-  get("calibrate").disabled = busy;
-  get("autoCalibrate").disabled = busy || !!points;
+  get("refresh").disabled = !configured || busy || !!points;
+  get("calibrate").disabled = !configured || busy;
+  get("quickCalibrate").disabled = !configured || busy || !!points;
+  get("autoCalibrate").disabled = !configured || busy || !!points;
   get("calibrate").textContent = points ? "Afbryd kalibrering" : "Detaljeret kalibrering";
 }
+async function loadCameras() {
+  const button = get("saveCameras");
+  const output = get("cameraStatus");
+  button.disabled = true;
+  output.textContent = "Henter kameraer fra Home Assistant.";
+  try {
+    const response = await fetch("cameras", {cache: "no-store"});
+    const data = await response.json();
+    if (!response.ok) throw Error(data.error);
+    for (const side of sides) {
+      const select = get("camera-" + side);
+      select.replaceChildren(new Option("Vælg kamera", ""));
+      for (const camera of data.entities) {
+        const label = camera.name + " (" + camera.id + ")" + (camera.available ? "" : " · utilgængelig");
+        const option = new Option(label, camera.id);
+        option.disabled = !camera.available;
+        select.add(option);
+      }
+      select.value = data.selected[side] ?? "";
+      if (select.selectedIndex < 0) select.selectedIndex = 0;
+    }
+    const enough = data.entities.filter(camera => camera.available).length >= 3;
+    button.disabled = !enough;
+    output.textContent = enough ? "" : "Tilføj tre tilgængelige kameraer i Home Assistant.";
+  } catch (err) {
+    output.textContent = err.message;
+  }
+}
+if (configured) {
+  get("cameraSettings").ontoggle = () => {
+    if (get("cameraSettings").open) loadCameras();
+  };
+}
+get("reloadCameras").onclick = loadCameras;
+get("cameraForm").onsubmit = async event => {
+  event.preventDefault();
+  const button = get("saveCameras");
+  button.disabled = true;
+  try {
+    const selected = Object.fromEntries(sides.map(side => [side, get("camera-" + side).value]));
+    const response = await fetch("cameras", {
+      method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(selected)
+    });
+    const data = await response.json();
+    if (!response.ok) throw Error(data.error);
+    location.reload();
+  } catch (err) {
+    get("cameraStatus").textContent = err.message;
+    button.disabled = false;
+  }
+};
 async function refresh() {
   await Promise.all(sides.map(side => new Promise((resolve, reject) => {
     const img = get(side);
@@ -272,17 +339,19 @@ get("autoCalibrate").onclick = () => run(async () => {
   const warnings = Object.values(data.warnings ?? {});
   if (warnings.length) get("status").textContent += " " + warnings.join(" ");
 });
-get("calibrate").onclick = () => run(async () => {
+const startCalibration = calibrationLabels => run(async () => {
   points = points ? null : Object.fromEntries(sides.map(side => [side, []]));
   editing = null;
   hideOverlay();
   get("status").textContent = "";
   if (points) {
-    setLabels(detailedLabels);
+    setLabels(calibrationLabels);
     await refresh();
     prompt();
   }
 });
+get("calibrate").onclick = () => startCalibration(detailedLabels);
+get("quickCalibrate").onclick = () => startCalibration(standardLabels);
 for (const side of sides) get(side).onclick = event => {
   if (!points || busy || (editing ? editing.done.has(side) : points[side].length === labels.length)) return;
   if (!editing && points[side].length > stepIndex()) return;
@@ -521,11 +590,13 @@ get("redoPoint").onclick = () => {
   controls();
 };
 get("saveCalibration").onclick = () => run(async () => {
-  await action("calibrate", points);
+  await action("calibrate", {...points, camera_entities: activeSelection});
   points = null;
   hideOverlay();
 });
 drawBoard([]);
-run(refresh).then(poll);
+controls();
+if (configured) run(refresh).then(poll);
+else loadCameras();
 </script>
 </html>
