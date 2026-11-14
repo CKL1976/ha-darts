@@ -3,6 +3,7 @@ import math
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Lock
+from urllib.error import HTTPError
 from urllib.request import urlopen
 
 import cv2
@@ -31,8 +32,15 @@ def ingress_only():
 
 def capture(side):
     options = json.loads(options_path.read_text())
-    with urlopen(options[f"{side}_url"], timeout=5) as response:
-        data = response.read(8_000_001)
+    for attempt in range(2):
+        try:
+            with urlopen(options[f"{side}_url"], timeout=5) as response:
+                data = response.read(8_000_001)
+            break
+        except HTTPError as exc:
+            exc.close()
+            if exc.code != 404 or attempt == 1:
+                raise ValueError(f"{side}: Kameraet svarede HTTP {exc.code}.") from exc
     if len(data) > 8_000_000:
         raise ValueError(f"{side}: Camera response exceeds 8 MB")
     frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
@@ -58,24 +66,6 @@ def transform(points):
     return cv2.getPerspectiveTransform(source, target.astype(np.float32))
 
 
-def dart_line(before, after, mapping):
-    if before.shape != after.shape:
-        raise ValueError("Kameraets billedstørrelse har ændret sig.")
-    delta = cv2.cvtColor(cv2.absdiff(before, after), cv2.COLOR_BGR2GRAY)
-    mask = cv2.threshold(delta, 35, 255, cv2.THRESH_BINARY)[1]
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    candidates = sorted(contours, key=cv2.contourArea, reverse=True)
-    if not candidates or cv2.contourArea(candidates[0]) < 150:
-        raise ValueError("Kunne ikke finde en ny pil i begge kamerabilleder.")
-    contour = candidates[0]
-    # L1 fit reduces the influence of the flights on the projected shaft axis.
-    vx, vy, x, y = cv2.fitLine(contour, cv2.DIST_L1, 0, .01, .01).ravel()
-    endpoints = np.float32([[[x, y], [x + 50 * vx, y + 50 * vy]]])
-    a, b = cv2.perspectiveTransform(endpoints, mapping)[0]
-    return a, b - a, mask
-
-
 def field_at(x, y):
     radius = math.hypot(x, y)
     if radius <= 6.35:
@@ -90,27 +80,113 @@ def field_at(x, y):
     return f"{' SDT'[factor]}{sector}", factor * sector
 
 
-def detect(before, after, mappings):
-    a, u, left = dart_line(before[0], after[0], mappings[0])
-    b, v, right = dart_line(before[1], after[1], mappings[1])
-    system = np.column_stack((u, -v))
-    if min(np.linalg.norm(u), np.linalg.norm(v)) == 0 or np.linalg.cond(system) > 12:
-        raise ValueError("Kameravinklerne giver et usikkert træfpunkt.")
-    hit = a + np.linalg.solve(system, b - a)[0] * u
-    if not np.isfinite(hit).all() or np.linalg.norm(hit) > 180:
-        raise ValueError("Træfpunktet kunne ikke bekræftes på skiven.")
-    for mask, mapping in zip((left, right), mappings):
-        point = cv2.perspectiveTransform(hit.reshape(1, 1, 2), np.linalg.inv(mapping))
-        x, y = np.rint(point[0, 0]).astype(int)
-        if not (0 <= x < mask.shape[1] and 0 <= y < mask.shape[0]):
-            raise ValueError("Træfpunktet ligger uden for et kamerabillede.")
-        if not mask[max(0, y-14):y+15, max(0, x-14):x+15].any():
-            raise ValueError("Træfpunktet stemmer ikke med ændringen i begge billeder.")
-    field, points = field_at(*hit)
-    if any(field_at(*(hit + offset))[0] != field
-           for offset in ((2, 0), (-2, 0), (0, 2), (0, -2))):
-        raise ValueError(f"Usikkert træf tæt på en wire. Bedste bud: {field}.")
-    return {"field": field, "points": points}
+def axes(mask, transform):
+    # Changed straight edges generate candidates; matching views constrain the impact.
+    edges = cv2.Canny(mask, 40, 100)
+    segments = cv2.HoughLinesP(edges, 1, np.pi / 180, 32,
+                               minLineLength=55, maxLineGap=15)
+    if segments is None:
+        return []
+    segments = segments.reshape(-1, 2, 2)
+    lengths = np.linalg.norm(segments[:, 1] - segments[:, 0], axis=1)
+    result = []
+    for index in np.argsort(lengths)[-14:][::-1]:
+        a, b = cv2.perspectiveTransform(segments[index:index+1].astype(np.float32),
+                                        transform)[0]
+        direction = b - a
+        norm = np.linalg.norm(direction)
+        if norm > 0.01 and np.isfinite(norm):
+            result.append((a, direction / norm, float(lengths[index])))
+    return result
+
+
+def detect(masks, transforms, diagnostics=None):
+    left_axes, right_axes = [axes(mask, transform)
+                            for mask, transform in zip(masks, transforms)]
+    if diagnostics is not None:
+        diagnostics["changed_pixels"] = [cv2.countNonZero(mask) for mask in masks]
+        diagnostics["line_counts"] = [len(left_axes), len(right_axes)]
+
+    inverses = [np.linalg.inv(transform) for transform in transforms]
+    candidates = {}
+    for a, u, length_a in left_axes:
+        for b, v, length_b in right_axes:
+            system = np.column_stack((u, -v))
+            if abs(np.linalg.det(system)) < 0.22:
+                continue
+            distance, _ = np.linalg.solve(system, b - a)
+            hit = a + distance * u
+            if np.linalg.norm(hit) > 185:
+                continue
+            # The impact should be near changed pixels in both original images.
+            for mask, inverse in zip(masks, inverses):
+                point = cv2.perspectiveTransform(hit.reshape(1, 1, 2),
+                                                 inverse)[0, 0]
+                x, y = np.rint(point).astype(int)
+                if not (0 <= x < mask.shape[1] and 0 <= y < mask.shape[0]):
+                    break
+                if not np.any(mask[max(0, y-10):y+11, max(0, x-10):x+11]):
+                    break
+            else:
+                field, points = field_at(*hit)
+                if field != "MISS":
+                    key = tuple(np.rint(hit / 3).astype(int))
+                    weight = length_a + length_b
+                    if key not in candidates or weight > candidates[key][0]:
+                        candidates[key] = (weight, hit, field, points)
+    if not candidates:
+        if diagnostics is not None:
+            diagnostics["reason"] = ("no_lines_in_one_or_both_views"
+                                     if not left_axes or not right_axes
+                                     else "no_supported_intersection")
+        return None
+    ranked = sorted(candidates.values(), key=lambda item: item[0], reverse=True)
+    weight, hit, field, points = ranked[0]
+    best = {"field": field, "points": points,
+            "x_mm": round(float(hit[0]), 1), "y_mm": round(float(hit[1]), 1)}
+    alternatives = list(dict.fromkeys(
+        item[2] for item in ranked[1:] if item[2] != field and item[0] >= weight * .78
+    ))
+    near_wire = any(field_at(*(hit + offset))[0] != field
+                    for offset in ((2, 0), (-2, 0), (0, 2), (0, -2)))
+    reasons = []
+    if alternatives:
+        reasons.append("competing_fields")
+    if near_wire:
+        reasons.append("near_wire")
+    if diagnostics is not None:
+        diagnostics.update(best=best, alternatives=alternatives,
+                           reason=", ".join(reasons) if reasons else "accepted")
+    return None if reasons else best
+
+
+def detect_throw(before, after, mappings):
+    masks = []
+    for previous, current in zip(before, after):
+        if previous.shape != current.shape:
+            raise ValueError("Kameraets billedstørrelse har ændret sig.")
+        delta = cv2.cvtColor(cv2.absdiff(previous, current), cv2.COLOR_BGR2GRAY)
+        masks.append(cv2.threshold(delta, 30, 255, cv2.THRESH_BINARY)[1])
+
+    diagnostics = {}
+    hit = detect(masks, mappings, diagnostics)
+    if hit is not None:
+        return hit
+
+    app.logger.warning("Kast afvist: %s", json.dumps(diagnostics))
+    reason = diagnostics["reason"]
+    if "best" in diagnostics:
+        message = f"Usikkert kast. Bedste bud: {diagnostics['best']['field']}."
+        if diagnostics["alternatives"]:
+            message += " Andre mulige felter: " + ", ".join(diagnostics["alternatives"]) + "."
+        if "near_wire" in reason:
+            message += " Træfpunktet ligger tæt på en wire."
+        raise ValueError(message)
+
+    left, right = diagnostics["line_counts"]
+    raise ValueError(
+        f"Fandt intet fælles træfpunkt. Linjer i venstre/højre billede: {left}/{right}."
+    )
 
 
 @app.get("/")
@@ -168,7 +244,7 @@ def act(action):
                     raise ValueError("Turen er slut. Fjern pilene og start en ny tur.")
                 points = json.loads(calibration_path.read_text())
                 frames = capture_pair()
-                darts.append(detect(reference, frames, [transform(points[s]) for s in sides]))
+                darts.append(detect_throw(reference, frames, [transform(points[s]) for s in sides]))
                 reference = frames
             else:
                 abort(404)
