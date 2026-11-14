@@ -201,11 +201,12 @@ def axes(mask, transform):
     lengths = np.linalg.norm(segments[:, 1] - segments[:, 0], axis=1)
     result = []
     for index in np.argsort(lengths)[-14:][::-1]:
-        a, b = project(segments[index:index+1].astype(np.float32), transform)[0]
+        segment = segments[index]
+        a, b = project(segment[None].astype(np.float32), transform)[0]
         direction = b - a
         norm = np.linalg.norm(direction)
         if norm > 0.01 and np.isfinite(norm):
-            result.append((a, direction / norm, float(lengths[index])))
+            result.append((a, direction / norm, float(lengths[index]), segment))
     return result
 
 
@@ -217,8 +218,8 @@ def detect(masks, transforms, diagnostics=None, near=None):
     inverses = transforms
     candidates = {}
     for left, right in combinations(range(len(lines)), 2):
-        for a, u, length_a in lines[left]:
-            for b, v, length_b in lines[right]:
+        for a, u, length_a, segment_a in lines[left]:
+            for b, v, length_b, segment_b in lines[right]:
                 system = np.column_stack((u, -v))
                 if abs(np.linalg.det(system)) < 0.22:
                     continue
@@ -240,13 +241,19 @@ def detect(masks, transforms, diagnostics=None, near=None):
                 key = tuple(np.rint(hit / 3).astype(int))
                 weight = (length_a + length_b) * (1 + .3 * (len(supporting) - 2))
                 if key not in candidates or weight > candidates[key][0]:
-                    candidates[key] = (weight, hit, field, points)
+                    candidates[key] = (weight, hit, field, points, {left: segment_a, right: segment_b})
     if not candidates:
         return None
 
-    _, hit, field, points = max(candidates.values(), key=lambda candidate: candidate[0])
+    _, hit, field, points, segments = max(candidates.values(), key=lambda candidate: candidate[0])
+    lines_by_view = []
+    for index, mapping in enumerate(transforms):
+        tip = project(hit.reshape(1, 1, 2), mapping, backwards=True)[0, 0]
+        segment = segments[index]
+        start = segment[np.argmax(np.linalg.norm(segment - tip, axis=1))]
+        lines_by_view.append({"start": start.tolist(), "tip": tip.tolist()})
     return {"field": field, "points": points,
-            "x_mm": round(float(hit[0]), 1), "y_mm": round(float(hit[1]), 1)}
+            "x_mm": round(float(hit[0]), 1), "y_mm": round(float(hit[1]), 1), "camera_lines": lines_by_view}
 
 
 def change_mask(previous, current):
@@ -363,13 +370,11 @@ def camera_image(side):
 def turn_state():
     views = {}
     if mappings is not None:
-        for side, mapping in zip(cameras, mappings):
-            markers = []
-            for dart in darts:
-                position = np.float32([[[dart["x_mm"], dart["y_mm"]]]])
-                pixel = project(position, mapping, backwards=True)[0, 0]
-                markers.append(pixel.tolist())
-            views[side] = markers
+        for index, side in enumerate(cameras):
+            views[side] = [
+                {**dart["camera_lines"][index], "field": dart["field"]}
+                for dart in darts
+            ]
     return {"camera_hits": views, "darts": list(darts), "total": sum(d["points"] for d in darts),
             "status": status,
             "mqtt": entities.connection_status if entities else "Angiv mqtt_host i Konfiguration"}

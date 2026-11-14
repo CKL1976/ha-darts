@@ -265,12 +265,28 @@ function drawCameraHits(data) {
     const scale = layer.width / Math.max(1, img.clientWidth);
     pen.font = "bold " + 12 * scale + "px system-ui";
     pen.lineWidth = 2 * scale;
-    for (const [index, [x, y]] of hits.entries()) {
+    for (const [index, hit] of hits.entries()) {
+      const [x, y] = hit.tip;
+      pen.lineCap = "round";
+      pen.beginPath();
+      pen.moveTo(...hit.start);
+      pen.lineTo(x, y);
+      pen.strokeStyle = "#101716";
+      pen.lineWidth = 5 * scale;
+      pen.stroke();
+      pen.strokeStyle = "#ffdc53";
+      pen.lineWidth = 2 * scale;
+      pen.stroke();
       pen.strokeStyle = pen.fillStyle = "#50e6ff";
       pen.beginPath();
       pen.arc(x, y, 8 * scale, 0, 2 * Math.PI);
       pen.stroke();
-      pen.fillText(index + 1, x + 10 * scale, y);
+      const label = (index + 1) + " · " + hit.field;
+      const labelX = Math.min(x + 10 * scale, layer.width - pen.measureText(label).width - 3 * scale);
+      pen.strokeStyle = "#101716";
+      pen.lineWidth = 4 * scale;
+      pen.strokeText(label, labelX, y);
+      pen.fillText(label, labelX, y);
     }
   }
 }
@@ -290,7 +306,10 @@ async function poll() {
       const data = await response.json();
       if (busy || points) return;
       drawTurn(data);
-      await run(refresh);
+      await run(async () => {
+        await refresh();
+        drawCameraHits(data);
+      });
     }
   } catch (err) {
     if (!busy && !points) get("status").textContent = "Kunne ikke hente kaststatus.";
