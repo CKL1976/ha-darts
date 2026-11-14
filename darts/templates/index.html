@@ -15,6 +15,7 @@ dialog::backdrop{background:#0009}
 canvas{display:block;width:100%;height:auto;cursor:crosshair;margin-bottom:14px}
 .camera-frame{position:relative}
 .camera-frame canvas{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;margin:0}
+#dartboard{cursor:default;background:#101716;margin:0}
 </style>
 <h1>HA Darts</h1>
 <p><strong id="score">0 point</strong> <span id="throws"></span></p>
@@ -37,6 +38,10 @@ canvas{display:block;width:100%;height:auto;cursor:crosshair;margin-bottom:14px}
 {% if third_camera %}
 <figure><figcaption>Center Cam</figcaption><div class="camera-frame"><img id="third" alt="RTSP-kamerabillede"><canvas id="thirdOverlay" hidden></canvas></div></figure>
 {% endif %}
+<figure>
+  <figcaption>Dartskive · træfpunkter</figcaption>
+  <canvas id="dartboard" width="400" height="400" role="img" aria-label="Dartskive uden registrerede pile"></canvas>
+</figure>
 </div>
 <dialog id="zoom">
 <h2 id="zoomTitle"></h2>
@@ -52,6 +57,7 @@ if (get("third")) sides.push("third");
 const cameraNames = {left: "Venstre kamera", right: "Højre kamera", third: "Center Cam"};
 const completed = () => points && sides.every(side => points[side].length === labels.length);
 const stepIndex = () => Math.min(...sides.map(side => points[side].length));
+const board = {{ board | tojson }};
 const wires = ["5/20", "13/6", "17/3", "8/11"];
 const labels = [
   ...wires.map(wire => "Inderste dobbeltwire " + wire),
@@ -102,7 +108,70 @@ async function action(name, payload) {
   if (!response.ok) throw Error(data.error);
   drawTurn(data);
 }
+function drawBoard(darts) {
+  const view = get("dartboard");
+  const pen = view.getContext("2d");
+  const center = view.width / 2;
+  const wedge = 2 * Math.PI / board.sectors.length;
+
+  function ring(outer, inner, start, end, color) {
+    pen.beginPath();
+    pen.arc(0, 0, outer, start, end);
+    if (inner > 0) pen.arc(0, 0, inner, end, start, true);
+    else pen.lineTo(0, 0);
+    pen.closePath();
+    pen.fillStyle = color;
+    pen.fill();
+    pen.strokeStyle = "#808080";
+    pen.lineWidth = .7;
+    pen.stroke();
+  }
+
+  pen.clearRect(0, 0, view.width, view.height);
+  pen.save();
+  pen.translate(center, center);
+  ring(198, 0, 0, 2 * Math.PI, "#181818");
+  for (const [index, number] of board.sectors.entries()) {
+    const angle = index * wedge - Math.PI / 2;
+    const start = angle - wedge / 2;
+    const end = angle + wedge / 2;
+    const single = index % 2 ? "#dec89d" : "#242424";
+    const multiplier = index % 2 ? "#178054" : "#b73338";
+    ring(board.treble_inner, board.bull_outer, start, end, single);
+    ring(board.treble_outer, board.treble_inner, start, end, multiplier);
+    ring(board.double_inner, board.treble_outer, start, end, single);
+    ring(board.double_outer, board.double_inner, start, end, multiplier);
+    pen.font = "bold 15px system-ui";
+    pen.textAlign = "center";
+    pen.textBaseline = "middle";
+    pen.fillStyle = "#fff";
+    const labelRadius = board.double_outer + 14;
+    pen.fillText(number, labelRadius * Math.cos(angle), labelRadius * Math.sin(angle));
+  }
+  ring(board.bull_outer, 0, 0, 2 * Math.PI, "#178054");
+  ring(board.bull_inner, 0, 0, 2 * Math.PI, "#b73338");
+
+  for (const [index, dart] of darts.entries()) {
+    const {x_mm: x, y_mm: y} = dart;
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+    pen.beginPath();
+    pen.arc(x, y, 7, 0, 2 * Math.PI);
+    pen.fillStyle = "#50e6ff";
+    pen.fill();
+    pen.strokeStyle = "#101716";
+    pen.lineWidth = 1.5;
+    pen.stroke();
+    pen.font = "bold 10px system-ui";
+    pen.fillStyle = "#101716";
+    pen.fillText(index + 1, x, y);
+  }
+  pen.restore();
+  view.setAttribute("aria-label", darts.length
+    ? darts.map((dart, index) => "Pil " + (index + 1) + " " + dart.field).join(", ")
+    : "Dartskive uden registrerede pile");
+}
 function drawTurn(data) {
+  drawBoard(data.darts);
   get("score").textContent = data.total + " point";
   get("throws").textContent = data.darts.map(d => d.field).join(" · ");
   get("status").textContent = data.status;
@@ -271,6 +340,7 @@ get("saveCalibration").onclick = () => run(async () => {
   points = null;
   hideOverlay();
 });
+drawBoard([]);
 run(refresh).then(poll);
 </script>
 </html>

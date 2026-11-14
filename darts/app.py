@@ -226,7 +226,12 @@ def detect_throw(before, after, mappings, board):
 
 @app.get("/")
 def index():
-    return render_template("index.html", third_camera="third" in cameras)
+    return render_template(
+        "index.html", third_camera="third" in cameras,
+        board={"sectors": sectors, "bull_inner": bull_inner, "bull_outer": bull_outer,
+               "treble_inner": treble_inner, "treble_outer": treble_outer,
+               "double_inner": double_inner, "double_outer": double_outer},
+    )
 
 
 @app.get("/image/<side>")
