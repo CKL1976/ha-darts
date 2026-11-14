@@ -436,7 +436,7 @@ async function previewCalibration(automatic = false) {
   const worst = side => Math.max(...data.errors[side]).toFixed(1);
   get("status").textContent = "Sammenlign de blå wirer og tal med skiven. Største afvigelse: " +
     sides.map(side => cameraNames[side] + " " + worst(side) + " px").join(", ") + ".";
-  if (automatic) get("status").textContent = "Automatisk forslag. Kontrollér de blå wirer og tal, før du gemmer.";
+  if (automatic) get("status").textContent = "Kontrollér, at de blå linjer ligger midt på stålwirerne, før du gemmer.";
   const combined = labels.map((_, index) => Math.max(...sides.map(side => data.errors[side][index])));
   get("editPoint").selectedIndex = combined.indexOf(Math.max(...combined));
 }

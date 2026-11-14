@@ -12,6 +12,7 @@ import numpy as np
 from flask import Flask, Response, abort, render_template, request
 from waitress import serve
 from scipy.interpolate import LinearNDInterpolator
+from scipy.optimize import least_squares
 
 from camera import RtspFeed, SnapshotCamera
 from mqtt_entities import DartEntities
@@ -121,6 +122,34 @@ def transform(points, radius=double_outer):
 
 class CalibrationMesh:
     def __init__(self, source, target, forward, inverse):
+        # Add intermediate points along each curved ring. Interpolate the
+        # correction to the perspective projection around the ring, so the
+        # outer double stays curved and inside the calibrated region.
+        base = cv2.perspectiveTransform(target[None], inverse)[0]
+        corrections = (source - base)[1:].reshape(len(mesh_radii), len(sectors), 2)
+        extra_targets, extra_sources = [], []
+        indices = np.arange(len(sectors))
+        for ring, radius in enumerate(mesh_radii):
+            for fraction in (.25, .5, .75):
+                points = board_points(indices + fraction, radius, -sector_angle / 2)
+                projected = cv2.perspectiveTransform(points[None], inverse)[0]
+                correction = corrections[ring]
+                extra_targets.extend(points)
+                extra_sources.extend(projected + (1 - fraction) * correction
+                                     + fraction * np.roll(correction, -1, axis=0))
+        # Extend the mesh beyond the scoring wire so points in the black
+        # surround use the same local coordinate system when scored as OUT.
+        outer = board_points(np.arange(0, len(sectors), .25), 190, -sector_angle / 2)
+        projected = cv2.perspectiveTransform(outer[None], inverse)[0]
+        correction = corrections[-1]
+        phase = np.arange(len(outer)) / 4
+        index = phase.astype(int)
+        fraction = (phase - index)[:, None]
+        extra_targets.extend(outer)
+        extra_sources.extend(projected + (1 - fraction) * correction[index]
+                             + fraction * correction[(index + 1) % len(sectors)])
+        source = np.vstack((source, extra_sources)).astype(np.float32)
+        target = np.vstack((target, extra_targets)).astype(np.float32)
         try:
             self.forward = LinearNDInterpolator(source, target)
             self.inverse = LinearNDInterpolator(target, source)
@@ -519,6 +548,100 @@ def refine_calibration(frame, initial):
     return fitted if error(fitted) + .1 < error(baseline) else baseline
 
 
+def wire_profiles(gray, mapping, points, normals):
+    # A steel wire is a narrow ridge or groove with two shoulders. A single
+    # brightness step at the edge of a colored segment has only one shoulder.
+    offsets = np.arange(-4, 4.25, .25, dtype=np.float32)
+    probes = points[:, None, :] + offsets[None, :, None] * normals[:, None, :]
+    pixels = project(probes.reshape(1, -1, 2), mapping, backwards=True).reshape(probes.shape)
+    signal = cv2.remap(gray, pixels[:, :, 0].copy(), pixels[:, :, 1].copy(),
+                       cv2.INTER_LINEAR)
+    center = signal[:, 4:-4]
+    left = center - signal[:, :-8]
+    right = center - signal[:, 8:]
+    contrast = np.maximum(np.minimum(left, right), .75 * np.minimum(-left, -right))
+    peak = (contrast - 1.8 * np.abs(offsets[4:-4])).argmax(axis=1)
+    rows = np.arange(len(points))
+    strength = contrast[rows, peak]
+    displacement = offsets[peak + 4]
+    good = (strength >= 9) & (peak > 0) & (peak < contrast.shape[1] - 1)
+    good &= ((pixels[:, :, 0] >= 1) & (pixels[:, :, 0] < gray.shape[1] - 1)
+             & (pixels[:, :, 1] >= 1) & (pixels[:, :, 1] < gray.shape[0] - 1)).all(axis=1)
+    return displacement, good
+
+
+def fit_steel_wires(frame, initial):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    ring_directions = board_points(
+        np.arange(len(sectors)).repeat(5) + np.tile([.2, .35, .5, .65, .8], len(sectors)),
+        1, -sector_angle / 2,
+    )
+    spokes = board_points(range(len(sectors)), 1, -sector_angle / 2)
+    tangents = np.column_stack((-spokes[:, 1], spokes[:, 0]))
+    # Spokes stop at the outer bull. Skip ring crossings in both profiles.
+    spoke_radii = np.array([23, 31, 43, 56, 69, 82, 94, 112, 124, 136, 148, 157])
+    ring_points = (np.asarray(mesh_radii, dtype=np.float32)[:, None, None]
+                   * ring_directions[None]).reshape(-1, 2)
+    spoke_points = (spokes[:, None, :] * spoke_radii[None, :, None]).reshape(-1, 2)
+    samples = np.vstack((ring_points, spoke_points)).astype(np.float32)
+    normals = np.vstack((np.tile(ring_directions, (len(mesh_radii), 1)),
+                         np.repeat(tangents, len(spoke_radii), axis=0)))
+    matching, good = wire_profiles(gray, initial, samples, normals)
+    ring_good = good[:len(ring_points)].reshape(len(mesh_radii), len(sectors), -1)
+    spoke_good = good[len(ring_points):].reshape(len(sectors), -1)
+    for quadrant in range(4):
+        group = slice(5 * quadrant, 5 * (quadrant + 1))
+        if ((ring_good[2:, group].sum(axis=(1, 2)) < 5).any()
+                or (spoke_good[group].sum(axis=1) >= 3).sum() < 2):
+            raise ValueError("Stålwirerne kunne ikke genkendes rundt om hele skiven.")
+
+    sample_points = samples[good].astype(np.float64)
+    sample_normals = normals[good]
+    shifts = matching[good]
+
+    def matrix(parameters):
+        return np.eye(3) + np.r_[parameters, 0].reshape(3, 3)
+
+    def shifted(points, parameters):
+        return cv2.perspectiveTransform(
+            (points / double_outer)[None], matrix(parameters)
+        )[0] * double_outer
+
+    def residual(parameters):
+        moved = shifted(sample_points, parameters)
+        return np.sum((moved - sample_points) * sample_normals, axis=1) - shifts
+
+    fit = least_squares(residual, np.zeros(8), loss="soft_l1", f_scale=.55,
+                        bounds=(-.05, .05))
+    if np.median(np.abs(fit.fun)) > 1.15:
+        raise ValueError("Fundne stålwirer stemmer ikke overens.")
+
+    target = np.vstack(([[0, 0]], *[spokes * radius for radius in mesh_radii]))
+    adjusted = shifted(target, fit.x)
+    # Correct residual lens distortion around each intersection using its
+    # neighboring ring arcs and the nearby length of the same spoke.
+    remaining = np.full(len(samples), np.nan)
+    remaining[good] = -fit.fun
+    ring_residual = remaining[:len(ring_points)].reshape(len(mesh_radii), len(sectors), -1)
+    spoke_residual = remaining[len(ring_points):].reshape(len(sectors), -1)
+    for ring, radius in enumerate(mesh_radii):
+        for sector in range(len(sectors)):
+            radial = np.r_[ring_residual[ring, sector - 1, -3:],
+                           ring_residual[ring, sector, :3]]
+            radial = radial[np.isfinite(radial)]
+            nearby = np.argsort(np.abs(spoke_radii - radius))[:5]
+            angular = spoke_residual[sector, nearby]
+            angular = angular[np.isfinite(angular)]
+            anchor = adjusted[1 + ring * len(sectors) + sector]
+            if len(radial) >= 4:
+                anchor += np.clip(np.median(radial), -2, 2) * spokes[sector]
+            if radius >= treble_inner and len(angular) >= 3:
+                anchor += np.clip(np.median(angular), -2, 2) * tangents[sector]
+    source = project(adjusted.astype(np.float32)[None], initial, backwards=True)[0]
+    transform(source)
+    return source.tolist()
+
+
 @app.post("/auto-calibrate")
 def auto_calibrate():
     try:
@@ -533,31 +656,19 @@ def auto_calibrate():
         proposal, images, warnings = {}, {}, {}
         for side, frame in zip(cameras, frames):
             initial = transform(saved[side], radius)
-            detailed = isinstance(initial, CalibrationMesh)
             try:
-                fitted = refine_calibration(frame, initial)
-            except ValueError as exc:
+                proposal[side] = fit_steel_wires(frame, initial)
+            except (ValueError, cv2.error, np.linalg.LinAlgError) as exc:
                 name = {"left": "Venstre kamera", "right": "Højre kamera", "third": "Center Cam"}[side]
                 warnings[side] = f"{name}: {exc}"
-                fitted = np.eye(3) if detailed else initial
-            anchors = np.vstack((
-                board_points([sectors.index(n) for n in anchor_sectors], double_inner, -sector_angle / 2),
-                board_points([sectors.index(n) for n in anchor_sectors], treble_outer, -sector_angle / 2),
-                [[0, 0]],
-            )).astype(np.float32)
-            if detailed:
-                source, target = calibration_geometry(saved[side], radius)
-                adjusted = project(target[None], fitted, backwards=True)[0]
-                # Apply the fitted shift locally while preserving the manual mesh.
-                shifted = project(adjusted[None], initial, backwards=True)[0]
-                proposal[side] = (source + shifted - project(target[None], initial, backwards=True)[0]).tolist()
-                try:
-                    transform(proposal[side], double_inner)
-                except (ValueError, cv2.error, np.linalg.LinAlgError):
-                    warnings[side] = "Automatisk justering blev afvist for dette kamera."
+                if isinstance(initial, CalibrationMesh):
                     proposal[side] = saved[side]
-            else:
-                proposal[side] = project(anchors[None], fitted, backwards=True)[0].tolist()
+                else:
+                    anchors = np.vstack(([[0, 0]], *[
+                        board_points(range(len(sectors)), ring, -sector_angle / 2)
+                        for ring in mesh_radii
+                    ])).astype(np.float32)
+                    proposal[side] = project(anchors[None], initial, backwards=True)[0].tolist()
             ok, jpeg = cv2.imencode(".jpg", frame)
             if not ok:
                 raise ValueError("Kunne ikke vise kalibreringsbilledet.")
