@@ -262,15 +262,39 @@ def detect(masks, transforms, diagnostics=None, before=None, near=None):
 
 
 def center_hit(mask, mapping, frame, baseline):
-    # Center Cam is mounted so the tip appears below the barrel.
-    clean = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    # Remove newly visible green flight and shaft pixels before choosing
+    # a barrel, so a large flight cannot win the contour search.
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    prior = cv2.cvtColor(baseline, cv2.COLOR_BGR2HSV)
+    hue, saturation, value = hsv.transpose(2, 0, 1)
+    flight = ((hue >= 35) & (hue <= 95) & (saturation >= 100)
+              & (value >= 65) & (saturation.astype(int) - prior[:, :, 1] >= 25))
+    metal = mask.copy()
+    metal[flight] = 0
+    clean = cv2.morphologyEx(metal, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
     contours, _ = cv2.findContours(clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    if not contours:
-        return None
-    contour = max(contours, key=cv2.contourArea)
-    _, _, width, height = cv2.boundingRect(contour)
-    if cv2.contourArea(contour) < 80 or height < 20 or max(width, height) > .45 * max(mask.shape):
-        return None
+    candidates = []
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        short, long = sorted(cv2.minAreaRect(contour)[1])
+        if area >= 80 and short >= 2 and long >= 20 and long / short >= 2.2:
+            if long <= .45 * max(mask.shape):
+                candidates.append((long, contour))
+    for _, contour in sorted(candidates, key=lambda item: item[0], reverse=True):
+        tip = barrel_tip(contour, metal)
+        if tip is None:
+            continue
+        hit = project(tip, mapping)[0, 0]
+        field, points = field_at(*hit)
+        if field != "MISS":
+            return {"field": field, "points": points,
+                    "x_mm": round(float(hit[0]), 1), "y_mm": round(float(hit[1]), 1),
+                    "center_pixel": tip[0, 0].tolist()}
+    return None
+
+
+def barrel_tip(contour, mask):
+    _, _, _, height = cv2.boundingRect(contour)
     pixels = contour.reshape(-1, 2)
     edge_y = int(pixels[:, 1].max())
     # Fit the lower barrel only: the flights and upper shaft can pull
@@ -304,26 +328,8 @@ def center_hit(mask, mapping, frame, baseline):
     # A barrel endpoint alone is not a reliable impact coordinate.
     if len(hits) < 4:
         return None
-    tip = np.float32([[hits[-1]]])
-    x, y = np.rint(tip[0, 0]).astype(int)
-    region = (slice(max(0, y - 6), y + 7), slice(max(0, x - 6), x + 7))
-    current_hsv = cv2.cvtColor(frame[region], cv2.COLOR_BGR2HSV)
-    prior_hsv = cv2.cvtColor(baseline[region], cv2.COLOR_BGR2HSV)
-    hue, saturation, value = current_hsv.transpose(2, 0, 1)
-    # A visible patch of newly introduced, saturated green is flight or
-    # shaft material. The unchanged green sisal is excluded by the mask.
-    new_green = ((hue >= 35) & (hue <= 95) & (saturation >= 100)
-                 & (value >= 65) & (mask[region] != 0)
-                 & (saturation.astype(int) - prior_hsv[:, :, 1] >= 25))
-    if new_green.sum() >= 8:
-        return None
-    hit = project(tip, mapping)[0, 0]
-    field, points = field_at(*hit)
-    if field == "MISS":
-        return None
-    return {"field": field, "points": points,
-            "x_mm": round(float(hit[0]), 1), "y_mm": round(float(hit[1]), 1),
-            "center_pixel": tip[0, 0].tolist()}
+    row = hits[-1][1]
+    return np.float32([[[slope * row + intercept, row]]])
 
 
 def validate_center(hit, masks, transforms, board):
