@@ -14,10 +14,13 @@ from waitress import serve
 from scipy.interpolate import LinearNDInterpolator
 from scipy.optimize import least_squares
 
+from diagnostics import diagnostics, capture_sample
+
 from camera import CAMERA_ID, EntityCamera, camera_entities
 from mqtt_entities import DartEntities
 
 app = Flask(__name__)
+app.register_blueprint(diagnostics)
 lock = Lock()
 options_path = Path("/data/options.json")
 calibration_path = Path("/data/calibration.json")
@@ -38,7 +41,7 @@ next_refinement = 0
 pending = None
 clear_frames = 0
 startup_frames = None
-status = "Vælg dine tre Home Assistant-kameraer."
+status = "Vælg dine to Home Assistant-kameraer."
 darts = []
 entities = None
 cameras = {}
@@ -276,6 +279,10 @@ def detect_throw(before, after, mappings):
              for previous, current in zip(before, after)]
     diagnostics = {}
     hit = detect(masks, mappings, diagnostics)
+    try:
+        capture_sample(before, after, hit, json.loads(calibration_path.read_text()), camera_selection())
+    except (OSError, ValueError):
+        app.logger.exception("Kunne ikke gemme detektionsbilleder")
     if hit is not None:
         return hit
     counts = "/".join(map(str, diagnostics["tip_counts"]))

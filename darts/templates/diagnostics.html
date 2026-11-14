@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="da">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Markér pilespidser · HA Darts</title>
+<style>
+:root{color-scheme:dark;font:16px system-ui;background:#101716;color:#e9f4ed}
+body{max-width:1200px;margin:24px auto;padding:16px}a{color:#50e6ff}
+button,select{font:inherit;padding:10px;margin:5px} .views{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:18px}
+canvas{width:100%;cursor:crosshair;background:#203c31;touch-action:none}
+output{display:block;padding:12px}dialog{max-width:90vw;background:#182522;color:inherit}#zoom{width:450px;max-width:75vw}
+</style>
+<a href="./">Tilbage til HA Darts</a>
+<h1>Optag og markér pilespidser</h1>
+<p>Start optagelse, gå tilbage og kast én pil ad gangen. Der gemmes originale før- og efterbilleder, også når detektionen fejler. Højst 60 billedpar gemmes lokalt.</p>
+<button id="record">Start optagelse</button>
+<button id="reload">Opdatér liste</button>
+<a href="samples/export">Download billeder og markeringer</a>
+<output id="status" aria-live="polite"></output>
+<label>Billedpar <select id="samples"><option value="">Vælg billedpar</option></select></label>
+<label>Billede <select id="stage"><option value="after">Efter kast</option><option value="before">Før kast</option></select></label>
+<p>Vælg efterbilledet og klik tæt på indstikspunktet. Markér spidsen præcist i zoomvisningen for hvert kamera.</p>
+<div class="views">
+<div>Venstre kamera<canvas id="left"></canvas></div>
+<div>Højre kamera<canvas id="right"></canvas></div>
+</div>
+<button id="save" disabled>Gem begge spidser</button>
+<dialog id="dialog">
+<p id="zoomTitle"></p>
+<canvas id="zoom" width="480" height="480"></canvas>
+<button id="confirm" disabled>Bekræft spids</button><button id="cancel">Annullér</button>
+</dialog>
+<script>
+const get=id=>document.getElementById(id);
+const sides=["left","right"];
+let entries=[], current=null, tips={}, images={}, recording=false, zoom=null, generation=0;
+async function api(path,body){
+ const response=await fetch(path,body?{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}:{cache:"no-store"});
+ if(!response.ok) throw Error("Handlingen mislykkedes ("+response.status+").");
+ return response.json();
+}
+async function run(fn){try{await fn();}catch(error){get("status").textContent=error.message;}}
+async function refresh(){
+ const data=await api("samples"); entries=data.samples;recording=data.recording;
+ get("record").textContent=recording?"Stop optagelse":"Start optagelse";
+ get("status").textContent=entries.length+" / "+data.limit+" billedpar. "+(recording?"Optagelse aktiv.":"Optagelse stoppet.");
+ const previous=get("samples").value;
+ get("samples").replaceChildren(new Option("Vælg billedpar",""),...entries.map(entry=>new Option(
+ new Date(entry.created*1000).toLocaleTimeString()+" · "+(entry.prediction?.field??"Intet træf")+" · "+(Object.keys(entry.tips).length===2?"markeret":"mangler markering"),entry.id)));
+ get("samples").value=previous;
+}
+function paint(side){
+ const image=images[side], canvas=get(side);
+ if(!image)return;
+ canvas.width=image.naturalWidth;canvas.height=image.naturalHeight;
+ const pen=canvas.getContext("2d");pen.drawImage(image,0,0);
+ if(tips[side]&&get("stage").value==="after"){
+ const [x,y]=tips[side];pen.strokeStyle="#ffdc53";pen.lineWidth=3;
+ pen.beginPath();pen.moveTo(x-12,y);pen.lineTo(x+12,y);pen.moveTo(x,y-12);pen.lineTo(x,y+12);pen.stroke();
+ }
+}
+async function load(){
+ const ticket=++generation;images={};current=entries.find(entry=>entry.id===get("samples").value);
+ tips=structuredClone(current?.tips??{});get("save").disabled=true;
+ for(const side of sides)get(side).getContext("2d").clearRect(0,0,get(side).width,get(side).height);
+ if(!current)return;
+ const id=current.id,stage=get("stage").value;
+ await Promise.all(sides.map(side=>new Promise((resolve,reject)=>{
+ const image=new Image();image.onload=()=>{if(ticket===generation){images[side]=image;paint(side);}resolve();};
+ image.onerror=()=>reject(Error("Kunne ikke hente billedet."));
+ image.src="samples/"+id+"/"+side+"/"+stage;
+ })));
+ if(ticket===generation)get("save").disabled=Object.keys(tips).length!==2;
+}
+function zoomPaint(){
+ const pen=get("zoom").getContext("2d");
+ pen.drawImage(images[zoom.side],zoom.x,zoom.y,zoom.size,zoom.size,0,0,480,480);
+ if(zoom.point){
+ const [x,y]=zoom.point.map((value,index)=>(value-[zoom.x,zoom.y][index])*480/zoom.size);
+ pen.strokeStyle="#ffdc53";pen.lineWidth=1;pen.beginPath();
+ pen.moveTo(x-15,y);pen.lineTo(x+15,y);pen.moveTo(x,y-15);pen.lineTo(x,y+15);pen.stroke();
+ }
+}
+for(const side of sides)get(side).onclick=event=>{
+ if(!images[side]||get("stage").value!=="after")return;
+ const image=images[side],rect=get(side).getBoundingClientRect();
+ const x=(event.clientX-rect.left)*image.naturalWidth/rect.width,y=(event.clientY-rect.top)*image.naturalHeight/rect.height;
+ const size=Math.min(100,image.naturalWidth,image.naturalHeight);
+ zoom={side,size,x:Math.max(0,Math.min(x-size/2,image.naturalWidth-size)),y:Math.max(0,Math.min(y-size/2,image.naturalHeight-size)),point:null};
+ get("zoomTitle").textContent=side==="left"?"Venstre kamera":"Højre kamera";
+ get("confirm").disabled=true;zoomPaint();get("dialog").showModal();
+};
+get("zoom").onclick=event=>{
+ const rect=get("zoom").getBoundingClientRect();
+ zoom.point=[zoom.x+(event.clientX-rect.left)*zoom.size/rect.width,zoom.y+(event.clientY-rect.top)*zoom.size/rect.height];
+ get("confirm").disabled=false;zoomPaint();
+};
+get("confirm").onclick=()=>{tips[zoom.side]=zoom.point;paint(zoom.side);get("dialog").close();get("save").disabled=Object.keys(tips).length!==2;};
+get("cancel").onclick=()=>get("dialog").close();
+get("record").onclick=()=>run(async()=>{await api("samples",{recording:!recording});await refresh();});
+get("reload").onclick=()=>run(refresh);
+get("samples").onchange=()=>run(load);
+get("stage").onchange=()=>run(load);
+get("save").onclick=()=>run(async()=>{await api("samples/"+current.id+"/tips",tips);get("status").textContent="Spidserne er gemt.";});
+run(refresh);
+</script>
+</html>
