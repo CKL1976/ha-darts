@@ -261,7 +261,7 @@ def detect(masks, transforms, diagnostics=None, before=None, near=None):
             "x_mm": round(float(hit[0]), 1), "y_mm": round(float(hit[1]), 1)}
 
 
-def center_hit(mask, mapping):
+def center_hit(mask, mapping, frame, baseline):
     # Center Cam is mounted so the tip appears below the barrel.
     clean = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
     contours, _ = cv2.findContours(clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
@@ -305,6 +305,18 @@ def center_hit(mask, mapping):
     if len(hits) < 4:
         return None
     tip = np.float32([[hits[-1]]])
+    x, y = np.rint(tip[0, 0]).astype(int)
+    region = (slice(max(0, y - 6), y + 7), slice(max(0, x - 6), x + 7))
+    current_hsv = cv2.cvtColor(frame[region], cv2.COLOR_BGR2HSV)
+    prior_hsv = cv2.cvtColor(baseline[region], cv2.COLOR_BGR2HSV)
+    hue, saturation, value = current_hsv.transpose(2, 0, 1)
+    # A visible patch of newly introduced, saturated green is flight or
+    # shaft material. The unchanged green sisal is excluded by the mask.
+    new_green = ((hue >= 35) & (hue <= 95) & (saturation >= 100)
+                 & (value >= 65) & (mask[region] != 0)
+                 & (saturation.astype(int) - prior_hsv[:, :, 1] >= 25))
+    if new_green.sum() >= 8:
+        return None
     hit = project(tip, mapping)[0, 0]
     field, points = field_at(*hit)
     if field == "MISS":
@@ -338,7 +350,7 @@ def detect_throw(before, after, mappings, board, primary=None):
     if len(masks) == 3:
         if primary is not None:
             return validate_center(primary, masks, mappings, board)
-        hit = center_hit(masks[2], mappings[2])
+        hit = center_hit(masks[2], mappings[2], after[2], before[2])
         if hit is None:
             side_hit = detect(masks[:2], mappings[:2], before=board[:2])
             if side_hit is None:
