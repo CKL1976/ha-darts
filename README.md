@@ -45,19 +45,17 @@ hentes løbende. Hvis kameraets MJPEG-feed bruger en anden sti end /picture,
 angiv den i `left_live_url` og `right_live_url`. Kalibrering fryser billederne,
 så krydsene kan markeres på samme billedpar.
 
-## Farve ved wirekryds
+## Kastdetektion
 
-Ved et træf tæt på en wire kan appen bruge farven i billedet af den tomme
-skive til at vælge mellem nærliggende felter. Begge kameraer skal vise
-samme tydelige farve, og feltet skal være entydigt blandt kandidaterne.
+Center Cam søger efter en smal, aflang form og følger dens akse mod
+pilespidsen. Sidekameraerne validerer træffet geometrisk.
 
 ## Skivekort
 
 Kalibreringen og kastdetektionen bruger samme turneringslayout som Unicorn
 Eclipse Pro 2. Før du gemmer, vises de 20 tal og wirerne på begge billeder.
 Kontrollér især 20 øverst, 6 til højre, 3 nederst og 11 til venstre på den
-fysiske skive. Ved tydelig farveuoverensstemmelse i begge kameraer markeres
-kastet som usikkert.
+fysiske skive.
 
 ## Automatisk finjustering
 

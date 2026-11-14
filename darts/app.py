@@ -179,43 +179,7 @@ def axes(mask, transform):
     return result
 
 
-def expected_color(field):
-    if field == "DB":
-        return "red"
-    if field == "SB":
-        return "green"
-    if field.startswith("S"):
-        return "neutral"
-    if field.startswith(("D", "T")):
-        return "red" if sectors.index(int(field[1:])) % 2 == 0 else "green"
-    return None
-
-
-def surface_color(frame, x, y):
-    if not (4 <= x < frame.shape[1] - 4 and 4 <= y < frame.shape[0] - 4):
-        return None
-    patch = frame[y-4:y+5, x-4:x+5]
-    hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
-    hue, saturation, value = hsv.transpose(2, 0, 1)
-    saturated = (saturation >= 90) & (value >= 45)
-    votes = {
-        "red": saturated & ((hue <= 12) | (hue >= 168)),
-        "green": saturated & (hue >= 36) & (hue <= 95),
-        "neutral": (saturation <= 50) | (value < 35),
-    }
-    return next((color for color, pixels in votes.items() if pixels.mean() >= .80), None)
-
-
-def colors_at(hit, before, inverses):
-    colors = []
-    for frame, inverse in zip(before, inverses):
-        point = project(hit.reshape(1, 1, 2), inverse, backwards=True)[0, 0]
-        x, y = np.rint(point).astype(int)
-        colors.append(surface_color(frame, x, y))
-    return colors
-
-
-def detect(masks, transforms, diagnostics=None, before=None, near=None):
+def detect(masks, transforms, diagnostics=None, near=None):
     lines = [axes(mask, transform) for mask, transform in zip(masks, transforms)]
     if diagnostics is not None:
         diagnostics["line_counts"] = [len(view) for view in lines]
@@ -250,38 +214,23 @@ def detect(masks, transforms, diagnostics=None, before=None, near=None):
     if not candidates:
         return None
 
-    def rank(candidate):
-        weight, hit, field, _ = candidate
-        colors = colors_at(hit, before, inverses) if before is not None else []
-        matches = sum(color == expected_color(field) for color in colors)
-        return weight * (1 + .10 * matches)
-
-    _, hit, field, points = max(candidates.values(), key=rank)
+    _, hit, field, points = max(candidates.values(), key=lambda candidate: candidate[0])
     return {"field": field, "points": points,
             "x_mm": round(float(hit[0]), 1), "y_mm": round(float(hit[1]), 1)}
 
 
-def center_hit(mask, mapping, frame, baseline):
-    # Remove newly visible green flight and shaft pixels before choosing
-    # a barrel, so a large flight cannot win the contour search.
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    prior = cv2.cvtColor(baseline, cv2.COLOR_BGR2HSV)
-    hue, saturation, value = hsv.transpose(2, 0, 1)
-    flight = ((hue >= 35) & (hue <= 95) & (saturation >= 100)
-              & (value >= 65) & (saturation.astype(int) - prior[:, :, 1] >= 25))
-    metal = mask.copy()
-    metal[flight] = 0
-    clean = cv2.morphologyEx(metal, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+def center_hit(mask, mapping):
+    clean = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
     contours, _ = cv2.findContours(clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     candidates = []
     for contour in contours:
         area = cv2.contourArea(contour)
         short, long = sorted(cv2.minAreaRect(contour)[1])
         if area >= 80 and short >= 2 and long >= 20 and long / short >= 2.2:
-            if long <= .45 * max(mask.shape):
+            if short <= 24 and long <= .45 * max(mask.shape):
                 candidates.append((long, contour))
     for _, contour in sorted(candidates, key=lambda item: item[0], reverse=True):
-        tip = barrel_tip(contour, metal)
+        tip = barrel_tip(contour, mask)
         if tip is None:
             continue
         hit = project(tip, mapping)[0, 0]
@@ -332,40 +281,41 @@ def barrel_tip(contour, mask):
     return np.float32([[[slope * row + intercept, row]]])
 
 
-def validate_center(hit, masks, transforms, board):
+def validate_center(hit, masks, transforms):
     if hit.get("source") == "side_cameras":
         return hit
     position = np.float32([hit["x_mm"], hit["y_mm"]])
     # Find real edges before applying the spatial constraint. Cutting the
     # binary masks first introduces straight edges at the crop boundaries.
-    verified = detect(masks[:2], transforms[:2], before=board[:2], near=position)
+    verified = detect(masks[:2], transforms[:2], near=position)
     if verified is None:
         return {**hit, "center_field": hit["field"], "validation": "unconfirmed"}
     return {**verified, "center_pixel": hit["center_pixel"],
             "center_field": hit["field"], "validation": "side_cameras"}
 
 
-def detect_throw(before, after, mappings, board, primary=None):
+def detect_throw(before, after, mappings, primary=None):
     masks = []
     for previous, current in zip(before, after):
         if previous.shape != current.shape:
             raise ValueError("Kameraets billedstørrelse har ændret sig.")
-        delta = cv2.cvtColor(cv2.absdiff(previous, current), cv2.COLOR_BGR2GRAY)
+        delta = cv2.absdiff(cv2.cvtColor(previous, cv2.COLOR_BGR2GRAY),
+                            cv2.cvtColor(current, cv2.COLOR_BGR2GRAY))
         masks.append(cv2.threshold(delta, 30, 255, cv2.THRESH_BINARY)[1])
 
     if len(masks) == 3:
         if primary is not None:
-            return validate_center(primary, masks, mappings, board)
-        hit = center_hit(masks[2], mappings[2], after[2], before[2])
+            return validate_center(primary, masks, mappings)
+        hit = center_hit(masks[2], mappings[2])
         if hit is None:
-            side_hit = detect(masks[:2], mappings[:2], before=board[:2])
+            side_hit = detect(masks[:2], mappings[:2])
             if side_hit is None:
                 raise ValueError("Venter på en synlig pilespids.")
             return {**side_hit, "source": "side_cameras"}
         return hit
 
     diagnostics = {}
-    hit = detect(masks, mappings, diagnostics, before=board)
+    hit = detect(masks, mappings, diagnostics)
     if hit is not None:
         return hit
 
@@ -445,7 +395,7 @@ def analyze_frames(frames):
     clear_frames = 0
     if len(frames) == 3 and pending is not None:
         primary = darts[-1]
-        corrected = detect_throw(pending, frames, mappings, empty_board, primary=primary)
+        corrected = detect_throw(pending, frames, mappings, primary=primary)
         darts[-1] = corrected
         pending = None
         if entities and corrected["points"] != primary["points"]:
@@ -455,7 +405,7 @@ def analyze_frames(frames):
     if len(darts) >= 3:
         status = "Tur slut. Fjern pilene."
         return
-    hit = detect_throw(reference, frames, mappings, empty_board)
+    hit = detect_throw(reference, frames, mappings)
     if len(frames) == 2:
         previous = pending
         pending = hit
