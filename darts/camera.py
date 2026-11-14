@@ -1,10 +1,10 @@
 """Read HTTP JPEG snapshots or a continuous MJPEG response."""
 
 from http.client import HTTPException
-from threading import Condition, Thread
+from threading import Condition, Lock, Thread
 from time import monotonic, sleep
 from urllib.error import HTTPError
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
 MAX_FRAME = 8_000_000
 
@@ -38,6 +38,26 @@ def jpeg_frames(response):
             del buffer[:end + 2]
 
 
+class SnapshotCamera:
+    def __init__(self, url):
+        self.url = url
+        self.lock = Lock()
+
+    def latest(self, newer_than=0.0, timeout=5):
+        with self.lock:
+            try:
+                with urlopen(Request(self.url, headers={"Connection": "close"}), timeout=4) as response:
+                    frame = next(jpeg_frames(response), None)
+            except HTTPError as exc:
+                exc.close()
+                raise ValueError(f"Kameraet svarede HTTP {exc.code}.") from exc
+            except HTTPException as exc:
+                raise ValueError("Kameraet returnerede et ufuldstændigt svar.") from exc
+            if frame is None:
+                raise ValueError("Kameraet returnerede ikke et billede.")
+            return frame, monotonic()
+
+
 class CameraFeed:
     def __init__(self, url):
         self.url = url
@@ -63,11 +83,11 @@ class CameraFeed:
                 self.error = str(exc)
             sleep(0.8)
 
-    def latest(self, newer_than=0.0):
+    def latest(self, newer_than=0.0, timeout=5):
         with self.condition:
             if not self.condition.wait_for(
                 lambda: self.updated > newer_than and monotonic() - self.updated < 3,
-                timeout=5,
+                timeout=timeout,
             ):
                 raise ValueError(self.error if self.frame is None else "Kamerabilledet opdateres ikke.")
             return self.frame, self.updated

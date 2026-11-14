@@ -226,9 +226,8 @@ function drawTurn(data) {
   drawCameraHits(data);
   get("score").textContent = data.total + " point";
   get("throws").textContent = data.darts.map(d => {
-    if (!d.center_field) return d.field;
-    if (d.validation === "unconfirmed") return d.field + " (Center Cam)";
-    return d.center_field === d.field ? d.field : d.center_field + " → " + d.field;
+    if (d.validation === "disagrees") return d.field + " (Center Cam: " + d.center_field + ")";
+    return d.field;
   }).join(" · ");
   get("status").textContent = data.status;
   get("mqtt").textContent = data.mqtt;

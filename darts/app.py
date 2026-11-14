@@ -13,7 +13,7 @@ from flask import Flask, Response, abort, render_template, request
 from waitress import serve
 from scipy.interpolate import LinearNDInterpolator
 
-from camera import CameraFeed, RtspFeed
+from camera import RtspFeed, SnapshotCamera
 from mqtt_entities import DartEntities
 
 app = Flask(__name__)
@@ -47,9 +47,12 @@ def ingress_only():
         abort(403)
 
 
-def capture(side):
+def capture(side, wait_for_new=True):
     try:
-        data, timestamp = cameras[side].latest(last_capture.get(side, 0))
+        data, timestamp = cameras[side].latest(
+            last_capture.get(side, 0) if wait_for_new else 0,
+            timeout=5 if wait_for_new else 0,
+        )
         frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
         if frame is None:
             raise ValueError("Kameraet returnerede et ulæseligt billede.")
@@ -59,9 +62,17 @@ def capture(side):
     return frame
 
 
-def capture_pair():
+def capture_pair(strict=True):
+    def capture_view(side):
+        try:
+            return capture(side, wait_for_new=strict or side != "third")
+        except (ValueError, OSError, cv2.error):
+            if strict or side != "third":
+                raise
+            return None
+
     with ThreadPoolExecutor(max_workers=len(cameras)) as pool:
-        return list(pool.map(capture, cameras))
+        return list(pool.map(capture_view, cameras))
 
 
 def board_points(indices, radius, offset=0):
@@ -290,48 +301,38 @@ def barrel_tip(contour, mask):
     return length + len(hits), np.float32([[[slope * row + intercept, row]]])
 
 
-def validate_center(hit, masks, transforms):
-    if hit.get("source") == "side_cameras":
-        return hit
-    position = np.float32([hit["x_mm"], hit["y_mm"]])
-    # Find real edges before applying the spatial constraint. Cutting the
-    # binary masks first introduces straight edges at the crop boundaries.
-    verified = detect(masks[:2], transforms[:2], near=position)
-    if verified is None:
-        return {**hit, "center_field": hit["field"], "validation": "unconfirmed"}
-    return {**verified, "center_pixel": hit["center_pixel"],
-            "center_field": hit["field"], "validation": "side_cameras"}
+def change_mask(previous, current):
+    if previous.shape != current.shape:
+        raise ValueError("Kameraets billedstørrelse har ændret sig.")
+    delta = cv2.absdiff(cv2.cvtColor(previous, cv2.COLOR_BGR2GRAY),
+                        cv2.cvtColor(current, cv2.COLOR_BGR2GRAY))
+    return cv2.threshold(delta, 30, 255, cv2.THRESH_BINARY)[1]
 
 
-def detect_throw(before, after, mappings, primary=None):
-    masks = []
-    for previous, current in zip(before, after):
-        if previous.shape != current.shape:
-            raise ValueError("Kameraets billedstørrelse har ændret sig.")
-        delta = cv2.absdiff(cv2.cvtColor(previous, cv2.COLOR_BGR2GRAY),
-                            cv2.cvtColor(current, cv2.COLOR_BGR2GRAY))
-        masks.append(cv2.threshold(delta, 30, 255, cv2.THRESH_BINARY)[1])
-
-    if len(masks) == 3:
-        if primary is not None:
-            return validate_center(primary, masks, mappings)
-        hit = center_hit(masks[2], mappings[2])
-        if hit is None:
-            side_hit = detect(masks[:2], mappings[:2])
-            if side_hit is None:
-                raise ValueError("Venter på en synlig pilespids.")
-            return {**side_hit, "source": "side_cameras"}
-        return hit
-
+def detect_throw(before, after, mappings):
+    masks = [change_mask(previous, current)
+             for previous, current in zip(before[:2], after[:2])]
     diagnostics = {}
-    hit = detect(masks, mappings, diagnostics)
+    hit = detect(masks, mappings[:2], diagnostics)
     if hit is not None:
         return hit
-
     counts = "/".join(map(str, diagnostics["line_counts"]))
-    raise ValueError(
-        f"Fandt intet fælles træfpunkt. Linjer pr. kamera: {counts}."
-    )
+    raise ValueError(f"Fandt intet fælles træfpunkt. Linjer pr. kamera: {counts}.")
+
+
+def validate_center(hit, before, after, mappings):
+    if len(mappings) < 3 or before[2] is None or after[2] is None:
+        return hit
+    try:
+        candidate = center_hit(change_mask(before[2], after[2]), mappings[2])
+    except (ValueError, cv2.error, np.linalg.LinAlgError):
+        candidate = None
+    if candidate is None:
+        return {**hit, "validation": "unconfirmed"}
+    distance = math.hypot(hit["x_mm"] - candidate["x_mm"], hit["y_mm"] - candidate["y_mm"])
+    confirmed = distance <= 18 and hit["field"] == candidate["field"]
+    return {**hit, "center_pixel": candidate["center_pixel"], "center_field": candidate["field"],
+            "validation": "confirmed" if confirmed else "disagrees"}
 
 
 @app.get("/")
@@ -374,7 +375,7 @@ def turn_state():
 
 
 def board_is_clear(frames):
-    for baseline, frame in zip(empty_board, frames):
+    for baseline, frame in zip(empty_board[:2], frames[:2]):
         if baseline.shape != frame.shape:
             raise ValueError("Kameraets billedstørrelse har ændret sig.")
         delta = cv2.cvtColor(cv2.absdiff(baseline, frame), cv2.COLOR_BGR2GRAY)
@@ -402,33 +403,22 @@ def analyze_frames(frames):
         return
 
     clear_frames = 0
-    if len(frames) == 3 and pending is not None:
-        primary = darts[-1]
-        corrected = detect_throw(pending, frames, mappings, primary=primary)
-        darts[-1] = corrected
-        pending = None
-        if entities and corrected["points"] != primary["points"]:
-            entities.update_throw(corrected["points"], len(darts))
-        status = "Tur slut. Fjern pilene." if len(darts) == 3 else "Klar til næste pil."
-        return
     if len(darts) >= 3:
         status = "Tur slut. Fjern pilene."
         return
     hit = detect_throw(reference, frames, mappings)
-    if len(frames) == 2:
-        previous = pending
-        pending = hit
-        if previous is None or previous["field"] != hit["field"] or math.hypot(
-            previous["x_mm"] - hit["x_mm"], previous["y_mm"] - hit["y_mm"]
-        ) > 6:
-            status = f"Bekræfter {hit['field']}."
-            return
-
+    previous = pending
+    pending = hit
+    if previous is None or previous["field"] != hit["field"] or math.hypot(
+        previous["x_mm"] - hit["x_mm"], previous["y_mm"] - hit["y_mm"]
+    ) > 6:
+        status = f"Bekræfter {hit['field']}."
+        return
+    hit = validate_center(hit, reference, frames, mappings)
     darts.append(hit)
-    pending = reference if len(frames) == 3 else None
     reference = frames
-    status = (f"Center Cam: {hit['field']}. Validerer." if pending is not None else
-              "Tur slut. Fjern pilene." if len(darts) == 3 else "Klar til næste pil.")
+    pending = None
+    status = "Tur slut. Fjern pilene." if len(darts) == 3 else "Klar til næste pil."
     if entities:
         entities.update_throw(hit["points"], len(darts))
 
@@ -442,6 +432,8 @@ def refine_empty_board(frames):
     probes = board_points(range(len(sectors)), double_outer)[None]
     for index, frame in enumerate(frames):
         try:
+            if frame is None:
+                continue
             baseline = manual_mappings[index]
             if isinstance(baseline, CalibrationMesh):
                 continue
@@ -462,17 +454,16 @@ def watch_board():
             if reference is None:
                 continue
             try:
-                frames = capture_pair()
+                frames = capture_pair(strict=False)
                 if pending is None and all(a.shape == b.shape and np.count_nonzero(
                     cv2.cvtColor(cv2.absdiff(a, b), cv2.COLOR_BGR2GRAY) > 30
-                ) < 180 for a, b in zip(reference, frames)) and darts and not clear_frames:
+                ) < 180 for a, b in zip(reference[:2], frames[:2])) and darts and not clear_frames:
                     pending = None
                     status = "Tur slut. Fjern pilene." if len(darts) == 3 else "Klar til næste pil."
                     continue
                 analyze_frames(frames)
             except (OSError, ValueError, cv2.error, np.linalg.LinAlgError) as exc:
-                if len(cameras) == 2:
-                    pending = None
+                pending = None
                 clear_frames = 0
                 status = str(exc)
 
@@ -631,7 +622,7 @@ def act(action):
                 if any(side not in points for side in cameras):
                     raise ValueError("Kalibrér alle tilsluttede kameraer først.")
                 new_mappings = [transform(points[side], radius) for side in cameras]
-                frames = capture_pair()
+                frames = capture_pair(strict=False)
                 manual_mappings = new_mappings
                 mappings = new_mappings.copy()
                 next_refinement = 0
@@ -651,7 +642,7 @@ def act(action):
 
 if __name__ == "__main__":
     options = json.loads(options_path.read_text())
-    cameras = {side: CameraFeed(options.get(f"{side}_live_url") or options[f"{side}_url"])
+    cameras = {side: SnapshotCamera(options[f"{side}_url"])
                for side in sides}
     center_cam_url = options.get("center_cam") or options.get("third_camera_url")
     if center_cam_url:
