@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="da">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>HA Darts</title>
+<style>
+:root{color-scheme:dark; font:16px system-ui; background:#101716;color:#e9f4ed}
+body{max-width:1080px;margin:32px auto;padding:0 18px}
+h1{font-size:2rem}.views{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,360px),1fr));gap:16px}
+figure{margin:0}figcaption{margin-bottom:6px}img{display:block;width:100%;aspect-ratio:4/3;background:#1c2925;border-radius:8px}
+button{font:inherit;padding:9px 14px;border:1px solid #5ea984;border-radius:6px;background:#203c31;color:inherit;margin:0 4px 7px 0}
+button:disabled{opacity:.5}output{display:block;min-height:2rem}strong{font-size:1.4rem}
+dialog{max-width:min(480px,90vw);border:1px solid #5ea984;border-radius:8px;background:#182522;color:inherit}
+dialog::backdrop{background:#0009}
+canvas{display:block;width:100%;height:auto;cursor:crosshair;margin-bottom:14px}
+</style>
+<h1>HA Darts</h1>
+<p><strong id="score">0 point</strong> <span id="throws"></span></p>
+<div>
+<button id="reset">Start tur med tom skive</button>
+<button id="dart" disabled>Analysér ny pil</button>
+<button id="calibrate">Kalibrér</button>
+<button id="refresh">Hent billeder</button>
+</div>
+<output id="status" aria-live="polite"></output>
+<div class="views">
+<figure><figcaption>Venstre kamera</figcaption><img id="left" alt="Venstre kamerabillede"></figure>
+<figure><figcaption>Højre kamera</figcaption><img id="right" alt="Højre kamerabillede"></figure>
+</div>
+<dialog id="zoom">
+<h2 id="zoomTitle"></h2>
+<p>Klik på spidsens kontaktpunkt i udsnittet.</p>
+<canvas id="crop" width="420" height="420" aria-label="Forstørret kamerabillede"></canvas>
+<button id="confirm" disabled>Bekræft punkt</button>
+<button id="cancelZoom">Vælg udsnit igen</button>
+</dialog>
+<script>
+const get = id => document.getElementById(id);
+const sides = ["left", "right"];
+const wires = ["5/20", "13/6", "17/3", "8/11"];
+let points = null, busy = false, active = false, count = 0;
+let zoom = null;
+const cropSize = 180;
+const canvas = get("crop");
+const context = canvas.getContext("2d");
+function controls() {
+  get("reset").disabled = busy || !!points;
+  get("dart").disabled = busy || !!points || !active || count === 3;
+  get("refresh").disabled = busy;
+  get("calibrate").disabled = busy;
+  get("calibrate").textContent = points ? "Afbryd kalibrering" : "Kalibrér";
+}
+async function refresh() {
+  await Promise.all(sides.map(side => new Promise((resolve, reject) => {
+    const img = get(side);
+    img.onload = resolve;
+    img.onerror = () => reject(Error("Kunne ikke hente billedet fra " + side));
+    img.src = "image/" + side + "?t=" + Date.now();
+  })));
+}
+async function run(task) {
+  busy = true;
+  controls();
+  try { await task(); }
+  catch (err) { get("status").textContent = err.message; }
+  finally { busy = false; controls(); }
+}
+async function action(name, payload) {
+  const response = await fetch("action/" + name, {
+    method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(payload ?? {})
+  });
+  const data = await response.json();
+  if (!response.ok) throw Error(data.error);
+  active = name !== "calibrate";
+  count = data.darts.length;
+  get("score").textContent = data.total + " point";
+  get("throws").textContent = data.darts.map(d => d.field).join(" · ");
+  get("status").textContent = name === "calibrate" ? "Kalibrering gemt." :
+    count === 3 ? "Tur slut. Fjern pilene." : "Klar til næste pil.";
+}
+function prompt() {
+  const step = Math.min(points.left.length, points.right.length);
+  get("status").textContent = "Placér pilens spids ved den yderste dobbeltwire mellem " +
+    wires[step] + ". Placér pilen, hent billeder og vælg området ved spidsen i begge billeder.";
+}
+get("reset").onclick = () => run(() => action("reset"));
+get("dart").onclick = () => run(async () => { await action("dart"); await refresh(); });
+get("refresh").onclick = () => run(refresh);
+get("calibrate").onclick = () => {
+  points = points ? null : {left:[], right:[]};
+  get("status").textContent = "";
+  if (points) prompt();
+  controls();
+};
+for (const side of sides) get(side).onclick = event => {
+  if (!points || busy) return;
+  const other = side === "left" ? "right" : "left";
+  if (points[side].length > points[other].length) return;
+  const img = event.currentTarget;
+  if (!img.naturalWidth) return;
+  const rect = img.getBoundingClientRect();
+  const x = (event.clientX - rect.left) * img.naturalWidth / rect.width;
+  const y = (event.clientY - rect.top) * img.naturalHeight / rect.height;
+  const size = Math.min(cropSize, img.naturalWidth, img.naturalHeight);
+  zoom = {
+    side, img, size, selected: null,
+    x: Math.max(0, Math.min(x - size / 2, img.naturalWidth - size)),
+    y: Math.max(0, Math.min(y - size / 2, img.naturalHeight - size))
+  };
+  get("zoomTitle").textContent = wires[points[side].length] + " · " +
+    (side === "left" ? "Venstre kamera" : "Højre kamera");
+  drawCrop();
+  get("zoom").showModal();
+};
+function drawCrop() {
+  context.drawImage(zoom.img, zoom.x, zoom.y, zoom.size, zoom.size,
+                    0, 0, canvas.width, canvas.height);
+  get("confirm").disabled = !zoom.selected;
+  if (!zoom.selected) return;
+  const [x, y] = zoom.selected;
+  context.beginPath();
+  context.arc(x * canvas.width, y * canvas.height, 7, 0, 2 * Math.PI);
+  context.lineWidth = 3;
+  context.strokeStyle = "#ffff00";
+  context.stroke();
+}
+canvas.onclick = event => {
+  const rect = canvas.getBoundingClientRect();
+  zoom.selected = [(event.clientX - rect.left) / rect.width,
+                   (event.clientY - rect.top) / rect.height];
+  drawCrop();
+};
+get("cancelZoom").onclick = () => get("zoom").close();
+get("zoom").onclose = () => { zoom = null; };
+get("confirm").onclick = () => {
+  if (!zoom?.selected) return;
+  const {side, x, y, size, selected} = zoom;
+  points[side].push([x + selected[0] * size, y + selected[1] * size]);
+  get("zoom").close();
+  if (points.left.length === 4 && points.right.length === 4) {
+    const payload = points;
+    points = null;
+    run(() => action("calibrate", payload));
+  } else if (points.left.length === points.right.length) prompt();
+  else get("status").textContent = "Vælg og bekræft samme punkt i det andet billede.";
+};
+run(refresh);
+</script>
+</html>

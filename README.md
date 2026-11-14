@@ -6,7 +6,7 @@ HTTP og finder den nye pil ud fra forskellen mellem billeder før og efter kaste
 ## Installation
 
 Tilføj dette GitHub-repo under Indstillinger → Apps → App-butik → Repositories.
-Installér HA Darts. Under Konfiguration kan du ændre de to kameraers URL'er.
+Installér HA Darts. Under Konfiguration skal du erstatte eksempeladresserne med dine to kameraers URL'er, inklusive /picture.
 Start appen og åbn webgrænsefladen.
 
 ## Første tur

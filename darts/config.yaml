@@ -1,0 +1,17 @@
+name: HA Darts
+version: "0.1.0"
+slug: ha_darts
+description: Dart detection from two GRAN EYE IP cameras
+url: https://github.com/CKL1976/ha-darts
+arch:
+  - amd64
+  - aarch64
+ingress: true
+ingress_port: 8099
+panel_icon: mdi:bullseye-arrow
+options:
+  left_url: http://left-camera.local/picture
+  right_url: http://right-camera.local/picture
+schema:
+  left_url: url
+  right_url: url
