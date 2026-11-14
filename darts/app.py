@@ -150,8 +150,10 @@ def field_at(x, y):
         return "DB", 50
     if radius <= bull_outer:
         return "SB", 25
-    if radius > double_outer:
+    if radius > 225:
         return "MISS", 0
+    if radius > double_outer:
+        return "OUT", 0
     angle = math.degrees(math.atan2(x, -y))
     sector = sectors[int((angle + sector_angle / 2) % 360 // sector_angle)]
     factor = 3 if treble_inner <= radius <= treble_outer else 2 if radius >= double_inner else 1
