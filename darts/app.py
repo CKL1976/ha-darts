@@ -54,15 +54,15 @@ def capture_pair():
         return list(pool.map(capture, sides))
 
 
-def transform(points):
+def transform(points, radius=170):
     source = np.asarray(points, dtype=np.float32)
     if source.shape != (4, 2) or not np.isfinite(source).all():
         raise ValueError("Vælg fire punkter for hvert kamera.")
     if not cv2.isContourConvex(source) or cv2.contourArea(source) < 100:
         raise ValueError("Kalibreringspunkterne ligger forkert.")
-    # Outer double-ring intersections, clockwise from the 5/20 wire.
+    # Double-ring intersections, clockwise from the 5/20 wire.
     radians = np.deg2rad((-9, 81, 171, 261))
-    target = 170 * np.column_stack((np.sin(radians), -np.cos(radians)))
+    target = radius * np.column_stack((np.sin(radians), -np.cos(radians)))
     return cv2.getPerspectiveTransform(source, target.astype(np.float32))
 
 
@@ -227,9 +227,9 @@ def act(action):
                 data = request.get_json()
                 points = {side: data[side] for side in sides}
                 for coordinates in points.values():
-                    transform(coordinates)
+                    transform(coordinates, radius=162)
                 temp = calibration_path.with_suffix(".tmp")
-                temp.write_text(json.dumps(points))
+                temp.write_text(json.dumps({**points, "ring": "inner_double"}))
                 temp.replace(calibration_path)
                 reference = None
                 darts.clear()
@@ -244,7 +244,9 @@ def act(action):
                     raise ValueError("Turen er slut. Fjern pilene og start en ny tur.")
                 points = json.loads(calibration_path.read_text())
                 frames = capture_pair()
-                darts.append(detect_throw(reference, frames, [transform(points[s]) for s in sides]))
+                radius = 162 if points.get("ring") == "inner_double" else 170
+                mappings = [transform(points[side], radius) for side in sides]
+                darts.append(detect_throw(reference, frames, mappings))
                 reference = frames
             else:
                 abort(404)

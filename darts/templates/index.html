@@ -29,7 +29,7 @@ canvas{display:block;width:100%;height:auto;cursor:crosshair;margin-bottom:14px}
 </div>
 <dialog id="zoom">
 <h2 id="zoomTitle"></h2>
-<p>Klik på spidsens kontaktpunkt i udsnittet.</p>
+<p>Sæt X midt i krydset, hvor de røde og grønne dobbeltfelter møder de sorte og hvide felter.</p>
 <canvas id="crop" width="420" height="420" aria-label="Forstørret kamerabillede"></canvas>
 <button id="confirm" disabled>Bekræft punkt</button>
 <button id="cancelZoom">Vælg udsnit igen</button>
@@ -80,18 +80,20 @@ async function action(name, payload) {
 }
 function prompt() {
   const step = Math.min(points.left.length, points.right.length);
-  get("status").textContent = "Placér pilens spids ved den yderste dobbeltwire mellem " +
-    wires[step] + ". Placér pilen, hent billeder og vælg området ved spidsen i begge billeder.";
+  get("status").textContent = "Kalibrér mellem " +
+    wires[step] + ". Klik nær krydset på dobbeltringens inderste wire i begge billeder.";
 }
 get("reset").onclick = () => run(() => action("reset"));
 get("dart").onclick = () => run(async () => { await action("dart"); await refresh(); });
 get("refresh").onclick = () => run(refresh);
-get("calibrate").onclick = () => {
+get("calibrate").onclick = () => run(async () => {
   points = points ? null : {left:[], right:[]};
   get("status").textContent = "";
-  if (points) prompt();
-  controls();
-};
+  if (points) {
+    await refresh();
+    prompt();
+  }
+});
 for (const side of sides) get(side).onclick = event => {
   if (!points || busy) return;
   const other = side === "left" ? "right" : "left";
@@ -119,7 +121,11 @@ function drawCrop() {
   if (!zoom.selected) return;
   const [x, y] = zoom.selected;
   context.beginPath();
-  context.arc(x * canvas.width, y * canvas.height, 7, 0, 2 * Math.PI);
+  const px = x * canvas.width, py = y * canvas.height;
+  context.moveTo(px - 8, py - 8);
+  context.lineTo(px + 8, py + 8);
+  context.moveTo(px + 8, py - 8);
+  context.lineTo(px - 8, py + 8);
   context.lineWidth = 3;
   context.strokeStyle = "#ffff00";
   context.stroke();

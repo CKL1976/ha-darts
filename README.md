@@ -11,11 +11,11 @@ Start appen og åbn webgrænsefladen.
 
 ## Første tur
 
-1. Vælg Kalibrér. Brug én pil som markør ved de fire angivne kryds på
-   dobbeltringens yderste wire. Hent billeder ved hvert punkt og klik nær spidsen
-   i hvert billede. Klik præcist på kontaktpunktet i zoomvinduet og vælg
-   Bekræft punkt for hvert kamera. Du kan flytte markøren før bekræftelse. Hold kameraerne fast under brug.
-2. Fjern pilen og vælg Start tur med tom skive.
+1. Tøm skiven, og vælg Kalibrér. Vælg krydset på dobbeltringens
+   **inderste** wire ved 5/20, 13/6, 17/3 og 8/11. Sæt X i zoomvinduet
+   dér, hvor rød/grøn møder sort/hvid. Bekræft krydset for begge kameraer.
+2. Vælg Start tur med tom skive. Ældre kalibreringer bruger stadig den
+   yderste wire, indtil du gennemfører en ny kalibrering.
 3. Kast én pil, og vælg Analysér ny pil. Vent på resultatet, før du kaster igen.
    Gentag op til tre gange. Ved usikkert resultat vises en fejl, og den
    sidst godkendte score bevares.
