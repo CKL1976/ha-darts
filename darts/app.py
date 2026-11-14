@@ -268,26 +268,43 @@ def center_hit(mask, mapping):
     if not contours:
         return None
     contour = max(contours, key=cv2.contourArea)
-    x, y, width, height = cv2.boundingRect(contour)
+    _, _, width, height = cv2.boundingRect(contour)
     if cv2.contourArea(contour) < 80 or height < 20 or max(width, height) > .45 * max(mask.shape):
         return None
     pixels = contour.reshape(-1, 2)
-    bottom = pixels[pixels[:, 1] >= pixels[:, 1].max() - 2]
-    # Opening can erase the thin steel tip. Follow the raw mask just
-    # below the barrel, keeping the search close to its shaft direction.
-    vx, vy, cx, cy = cv2.fitLine(contour, cv2.DIST_L2, 0, .01, .01).ravel()
-    edge_y = int(bottom[:, 1].max())
-    if abs(vy) > .35:
-        for row in range(edge_y + 1, min(mask.shape[0], edge_y + min(32, height // 4))):
-            expected_x = int(round(cx + (row - cy) * vx / vy))
-            left, right = max(0, expected_x - 4), min(mask.shape[1], expected_x + 5)
-            if left >= right:
-                break
-            columns = np.flatnonzero(mask[row, left:right])
-            if not len(columns):
-                break
-            bottom = np.float32([[left + np.median(columns), row]])
-    tip = np.float32([[np.median(bottom, axis=0)]])
+    edge_y = int(pixels[:, 1].max())
+    # Fit the lower barrel only: the flights and upper shaft can pull
+    # a whole-contour fit away from the line of the steel point.
+    lower = pixels[(pixels[:, 1] >= edge_y - max(12, height // 3))
+                   & (pixels[:, 1] < edge_y - 2)]
+    rows = np.unique(lower[:, 1])
+    if len(rows) < 6:
+        return None
+    centers = np.array([np.median(lower[lower[:, 1] == row, 0]) for row in rows])
+    slope, intercept = np.polyfit(rows, centers, 1)
+    if abs(slope) > 2.5:
+        return None
+
+    # The point may disappear against dark sisal for a few rows. Bridge
+    # short gaps but require a narrow, aligned continuation of the barrel.
+    hits = []
+    for row in range(edge_y + 1, min(mask.shape[0], edge_y + max(12, min(48, height // 3)))):
+        expected = round(slope * row + intercept)
+        left, right = max(0, expected - 5), min(mask.shape[1], expected + 6)
+        if left >= right:
+            break
+        columns = np.flatnonzero(mask[row, left:right])
+        if 0 < len(columns) <= 7:
+            center = left + np.median(columns)
+            if abs(center - expected) <= 3:
+                hits.append((center, row))
+        if row - (hits[-1][1] if hits else edge_y) > 4:
+            break
+
+    # A barrel endpoint alone is not a reliable impact coordinate.
+    if len(hits) < 4:
+        return None
+    tip = np.float32([[hits[-1]]])
     hit = project(tip, mapping)[0, 0]
     field, points = field_at(*hit)
     if field == "MISS":
@@ -298,6 +315,8 @@ def center_hit(mask, mapping):
 
 
 def validate_center(hit, masks, transforms, board):
+    if hit.get("source") == "side_cameras":
+        return hit
     position = np.float32([hit["x_mm"], hit["y_mm"]])
     # Find real edges before applying the spatial constraint. Cutting the
     # binary masks first introduces straight edges at the crop boundaries.
@@ -321,7 +340,10 @@ def detect_throw(before, after, mappings, board, primary=None):
             return validate_center(primary, masks, mappings, board)
         hit = center_hit(masks[2], mappings[2])
         if hit is None:
-            raise ValueError("Venter på et træf fra Center Cam.")
+            side_hit = detect(masks[:2], mappings[:2], before=board[:2])
+            if side_hit is None:
+                raise ValueError("Venter på en synlig pilespids.")
+            return {**side_hit, "source": "side_cameras"}
         return hit
 
     diagnostics = {}
