@@ -16,7 +16,7 @@ from scipy.optimize import least_squares
 
 
 from camera import SnapshotCamera
-from deepdarts import DeepDarts, download_d1
+from deepdarts import DeepDarts, MODEL_HASHES, download_model
 from imaging import (decode_image, encode_image, fit_homography, grayscale,
                      hsv_image, project_points, sample_image, valid_quad)
 from mqtt_entities import DartEntities
@@ -275,7 +275,7 @@ def new_model_points(points, previous, frame, mapping):
 
 def detect_throws(before, after, mappings):
     if deepdarts_model is None:
-        raise ValueError("Installér DeepDarts D1 for at registrere kast.")
+        raise ValueError("Installér DeepDarts for at registrere kast.")
     if any(previous.shape != frame.shape for previous, frame in zip(before, after)):
         raise ValueError("Kameraets billedstørrelse har ændret sig.")
     views, counts = [[], []], [[], []]
@@ -299,7 +299,7 @@ def test_deepdarts():
     with lock:
         try:
             if deepdarts_model is None:
-                raise ValueError("Installér DeepDarts D1 først.")
+                raise ValueError("Installér DeepDarts først.")
             saved = saved_calibration()
             radius = double_inner if saved.get("ring") == "inner_double" else double_outer
             transforms = [transform(saved[side], radius) for side in camera_roles]
@@ -312,6 +312,7 @@ def test_deepdarts():
                     for frame, mapping in zip(frames, transforms)
                 ]
                 results[name] = {"left": len(views[0]), "right": len(views[1]),
+                                 "fields": [[field_at(*point)[0] for point in view] for view in views],
                                  "hits": [hit["field"] for hit in match_tips(views, transforms)]}
             return results
         except (OSError, ValueError, RuntimeError, np.linalg.LinAlgError) as exc:
@@ -320,10 +321,13 @@ def test_deepdarts():
 
 @app.post("/deepdarts/download")
 def install_default_deepdarts():
+    variant = request.args.get("model", "d1")
+    if variant not in MODEL_HASHES:
+        return {"error": "Vælg DeepDarts D1 eller D2."}, 400
     try:
-        weights = download_d1()
+        weights = download_model(variant)
     except (OSError, ValueError) as exc:
-        return {"error": f"Kunne ikke hente DeepDarts D1: {exc}"}, 502
+        return {"error": f"Kunne ikke hente DeepDarts {variant.upper()}: {exc}"}, 502
     return activate_model(weights)
 
 
@@ -440,7 +444,7 @@ def turn_state():
                 for dart in darts
             ]
     return {"camera_hits": views, "darts": list(darts), "total": sum(d["points"] for d in darts),
-            "status": ("Installér DeepDarts D1 for at registrere kast."
+            "status": ("Installér DeepDarts for at registrere kast."
                        if deepdarts_model is None and reference is not None else status),
             "mqtt": entities.connection_status if entities else "Angiv mqtt_host i Konfiguration"}
 

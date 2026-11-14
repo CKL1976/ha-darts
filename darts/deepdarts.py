@@ -7,15 +7,19 @@ from PIL import Image
 
 MAX_MODEL_BYTES = 64 * 1024 * 1024
 
-D1_URL = ("https://raw.githubusercontent.com/iambhabha/Dart-Vision/master/"
-          "deepdarts_models/deepdarts_d1.tflite")
-D1_SHA256 = "8bcaa21b54b053649a4b93929a5e97426e8d4f2eeeee3d749ef77a856df91a3b"
+MODEL_HASHES = {
+    "d1": "8bcaa21b54b053649a4b93929a5e97426e8d4f2eeeee3d749ef77a856df91a3b",
+    "d2": "395cde242447371b5fa8fb37af1117de8425513461db6c3f119bcb5efb279975",
+}
 
 
-def download_d1():
-    with urlopen(D1_URL, timeout=20) as response:
+def download_model(variant):
+    expected = MODEL_HASHES[variant]
+    url = ("https://raw.githubusercontent.com/iambhabha/Dart-Vision/master/"
+           f"deepdarts_models/deepdarts_{variant}.tflite")
+    with urlopen(url, timeout=20) as response:
         weights = response.read(MAX_MODEL_BYTES + 1)
-    if sha256(weights).hexdigest() != D1_SHA256:
+    if sha256(weights).hexdigest() != expected:
         raise ValueError("Den hentede fil matcher ikke den verificerede model.")
     return weights
 
@@ -50,7 +54,7 @@ def decode_tips(heads, width, height):
     predictions = []
     for head in heads:
         cells = head.reshape(-1, 10)
-        # The verified D1 export already returns normalized box centers
+        # The verified export already returns normalized box centers
         # and probabilities. Applying sigmoid or grid offsets again corrupts both.
         scores = cells[:, 4] * cells[:, 5]
         dart = np.argmax(cells[:, 5:], axis=1) == 0

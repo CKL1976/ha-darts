@@ -35,7 +35,8 @@ canvas{display:block;width:100%;height:auto;cursor:crosshair;margin-bottom:14px}
 <details>
 <summary>DeepDarts</summary>
 <p id="modelStatus" aria-live="polite">{{ "DeepDarts er aktiv." if deepdarts_active else "Installér DeepDarts D1 for at registrere kast." }}</p>
-<button id="downloadModel" type="button">Hent og installér DeepDarts D1</button>
+<button id="downloadD1" type="button">Hent og installér DeepDarts D1</button>
+<button id="downloadD2" type="button">Hent og installér DeepDarts D2</button>
 <button id="testModel" type="button">Test pilene i skiven</button>
 </details>
 <p><strong id="score">0 point</strong> <span id="throws"></span></p>
@@ -566,7 +567,8 @@ get("testModel").onclick = async () => {
     const details = await response.json();
     if (!response.ok) throw Error(details.error);
     output.textContent = Object.entries(details).map(([name, result]) =>
-      name + ": venstre " + result.left + ", højre " + result.right +
+      name + ": venstre " + (result.fields[0].join(", ") || "ingen") +
+      ", højre " + (result.fields[1].join(", ") || "ingen") +
       ", fælles " + (result.hits.join(", ") || "ingen")).join(" · ");
   } catch (error) {
     output.textContent = error.message;
@@ -574,12 +576,12 @@ get("testModel").onclick = async () => {
     button.disabled = false;
   }
 };
-get("downloadModel").onclick = async () => {
-  const button = get("downloadModel");
-  button.disabled = true;
-  get("modelStatus").textContent = "Henter og tester DeepDarts D1 …";
+async function installDeepDarts(variant) {
+  const buttons = [get("downloadD1"), get("downloadD2")];
+  for (const button of buttons) button.disabled = true;
+  get("modelStatus").textContent = "Henter og tester DeepDarts " + variant.toUpperCase() + " …";
   try {
-    const response = await fetch("deepdarts/download", {method: "POST"});
+    const response = await fetch("deepdarts/download?model=" + variant, {method: "POST"});
     const result = await response.json().catch(() => null);
     if (!response.ok || !result?.active) {
       throw Error(result?.error ?? "Installationen mislykkedes (" + response.status + ").");
@@ -588,9 +590,11 @@ get("downloadModel").onclick = async () => {
   } catch (error) {
     get("modelStatus").textContent = error.message;
   } finally {
-    button.disabled = false;
+    for (const button of buttons) button.disabled = false;
   }
-};
+}
+get("downloadD1").onclick = () => installDeepDarts("d1");
+get("downloadD2").onclick = () => installDeepDarts("d2");
 drawBoard([]);
 controls();
 if (configured) run(refresh).then(poll);
