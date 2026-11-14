@@ -375,7 +375,7 @@ def refine_empty_board(frames):
             proposal = refine_calibration(frame, baseline)
             raw = cv2.perspectiveTransform(probes, np.linalg.inv(baseline))
             updated = cv2.perspectiveTransform(raw, proposal)
-            if np.max(np.linalg.norm(updated - probes, axis=2)) <= 4:
+            if np.max(np.linalg.norm(updated - probes, axis=2)) <= 1:
                 mappings[index] = proposal
         except (ValueError, cv2.error, np.linalg.LinAlgError):
             continue
