@@ -10,8 +10,7 @@ Installér og start HA Darts, og åbn appens webgrænseflade.
 
 1. Tilføj dine kameraer med **Generic Camera** under Indstillinger → Enheder og
    tjenester, hvis de ikke allerede findes som kameraentiteter. Brug kameraernes
-   `/picture`-adresse som stillbillede for venstre og højre. Center Cam kan
-   bruge sin RTSP-adresse som streamkilde i Generic Camera.
+   `/picture`-adresse som stillbillede for venstre og højre.
 2. Åbn **Kameraer** i HA Darts, vælg en entitet til hver rolle, og tryk
    **Gem kameraer**.
 3. Vælg **Kalibrér 9 punkter** med tom skive efter opgradering fra
@@ -48,8 +47,7 @@ ved forbindelse til samme broker og discovery-prefix.
 ## Kastdetektion
 
 Venstre og højre kamera leverer stillbilleder til automatisk detektion og
-scoring. Center Cam leverer et stillbillede til validering. Home Assistant
-håndterer forbindelserne til kameraerne. Kalibrering fryser billederne,
+scoring. Home Assistant håndterer forbindelserne til kameraerne. Kalibrering fryser billederne,
 så krydsene kan markeres i samme billede.
 
 ## Skivekort

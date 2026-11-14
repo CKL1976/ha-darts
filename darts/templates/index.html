@@ -23,13 +23,11 @@ canvas{display:block;width:100%;height:auto;cursor:crosshair;margin-bottom:14px}
 <details id="cameraSettings"{% if not configured %} open{% endif %}>
 <summary>Kameraer</summary>
 <form id="cameraForm">
-  <p>Vælg tre kameraer fra Home Assistant.</p>
+  <p>Vælg to kameraer fra Home Assistant.</p>
   <label for="camera-left">Venstre kamera</label>
   <select id="camera-left" required></select>
   <label for="camera-right">Højre kamera</label>
   <select id="camera-right" required></select>
-  <label for="camera-third">Center Cam</label>
-  <select id="camera-third" required></select>
   <button id="saveCameras" disabled>Gem kameraer</button>
   <button type="button" id="reloadCameras">Opdatér liste</button>
   <output id="cameraStatus" aria-live="polite"></output>
@@ -54,7 +52,6 @@ canvas{display:block;width:100%;height:auto;cursor:crosshair;margin-bottom:14px}
 <div class="views">
 <figure><figcaption>Venstre kamera</figcaption><div class="camera-frame"><img id="left" alt="Venstre kamerabillede"><canvas id="leftOverlay" hidden></canvas></div></figure>
 <figure><figcaption>Højre kamera</figcaption><div class="camera-frame"><img id="right" alt="Højre kamerabillede"><canvas id="rightOverlay" hidden></canvas></div></figure>
-<figure><figcaption>Center Cam · gult kryds: fundet spids · blå ring: beregnet træf</figcaption><div class="camera-frame"><img id="third" alt="Center Cam-kamerabillede"><canvas id="thirdOverlay" hidden></canvas></div></figure>
 <figure>
   <figcaption>Dartskive · træfpunkter</figcaption>
   <canvas id="dartboard" width="400" height="400" role="img" aria-label="Dartskive uden registrerede pile"></canvas>
@@ -69,10 +66,10 @@ canvas{display:block;width:100%;height:auto;cursor:crosshair;margin-bottom:14px}
 </dialog>
 <script>
 const get = id => document.getElementById(id);
-const sides = ["left", "right", "third"];
+const sides = ["left", "right"];
 const configured = {{ configured | tojson }};
 const activeSelection = {{ selection | tojson }};
-const cameraNames = {left: "Venstre kamera", right: "Højre kamera", third: "Center Cam"};
+const cameraNames = {left: "Venstre kamera", right: "Højre kamera"};
 const completed = () => points && sides.every(side => points[side].length === labels.length);
 const stepIndex = () => Math.min(...sides.map(side => points[side].length));
 const board = {{ board | tojson }};
@@ -138,9 +135,9 @@ async function loadCameras() {
       select.value = data.selected[side] ?? "";
       if (select.selectedIndex < 0) select.selectedIndex = 0;
     }
-    const enough = data.entities.filter(camera => camera.available).length >= 3;
+    const enough = data.entities.filter(camera => camera.available).length >= sides.length;
     button.disabled = !enough;
-    output.textContent = enough ? "" : "Tilføj tre tilgængelige kameraer i Home Assistant.";
+    output.textContent = enough ? "" : "Tilføj to tilgængelige kameraer i Home Assistant.";
   } catch (err) {
     output.textContent = err.message;
   }
@@ -268,18 +265,7 @@ function drawCameraHits(data) {
     const scale = layer.width / Math.max(1, img.clientWidth);
     pen.font = "bold " + 12 * scale + "px system-ui";
     pen.lineWidth = 2 * scale;
-    for (const [index, hit] of hits.entries()) {
-      if (hit.initial) {
-        const [x, y] = hit.initial;
-        pen.strokeStyle = "#ffdc53";
-        pen.beginPath();
-        pen.moveTo(x - 6 * scale, y);
-        pen.lineTo(x + 6 * scale, y);
-        pen.moveTo(x, y - 6 * scale);
-        pen.lineTo(x, y + 6 * scale);
-        pen.stroke();
-      }
-      const [x, y] = hit.final;
+    for (const [index, [x, y]] of hits.entries()) {
       pen.strokeStyle = pen.fillStyle = "#50e6ff";
       pen.beginPath();
       pen.arc(x, y, 8 * scale, 0, 2 * Math.PI);
@@ -292,10 +278,7 @@ function drawTurn(data) {
   drawBoard(data.darts);
   drawCameraHits(data);
   get("score").textContent = data.total + " point";
-  get("throws").textContent = data.darts.map(d => {
-    if (d.validation === "disagrees") return d.field + " (Center Cam: " + d.center_field + ")";
-    return d.field;
-  }).join(" · ");
+  get("throws").textContent = data.darts.map(dart => dart.field).join(" · ");
   get("status").textContent = data.status;
   get("mqtt").textContent = data.mqtt;
 }

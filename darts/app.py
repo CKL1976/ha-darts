@@ -22,7 +22,7 @@ lock = Lock()
 options_path = Path("/data/options.json")
 calibration_path = Path("/data/calibration.json")
 camera_path = Path("/data/cameras.json")
-camera_roles = ("left", "right", "third")
+camera_roles = ("left", "right")
 sectors = (20, 1, 18, 4, 13, 6, 10, 15, 2, 17, 3, 19, 7, 16, 8, 11, 14, 9, 12, 5)
 sector_angle = 360 / len(sectors)
 bull_inner, bull_outer = 6.35, 15.9
@@ -60,19 +60,10 @@ def capture(side):
     return frame
 
 
-def capture_pair(strict=True):
+def capture_pair():
     require_cameras()
-
-    def capture_view(side):
-        try:
-            return capture(side)
-        except (ValueError, OSError, cv2.error):
-            if strict or side != "third":
-                raise
-            return None
-
-    with ThreadPoolExecutor(max_workers=len(cameras)) as pool:
-        return list(pool.map(capture_view, cameras))
+    with ThreadPoolExecutor(max_workers=len(camera_roles)) as pool:
+        return list(pool.map(capture, camera_roles))
 
 
 def board_points(indices, radius, offset=0):
@@ -258,77 +249,6 @@ def detect(masks, transforms, diagnostics=None, near=None):
             "x_mm": round(float(hit[0]), 1), "y_mm": round(float(hit[1]), 1)}
 
 
-def center_hit(mask, mapping):
-    clean = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-    contours, _ = cv2.findContours(clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    candidates = []
-    for contour in contours:
-        if cv2.contourArea(contour) < 80:
-            continue
-        evidence = barrel_tip(contour, mask)
-        if evidence is not None:
-            candidates.append(evidence)
-    for _, tip in sorted(candidates, key=lambda item: item[0], reverse=True):
-        hit = project(tip, mapping)[0, 0]
-        field, points = field_at(*hit)
-        if field != "MISS":
-            return {"field": field, "points": points,
-                    "x_mm": round(float(hit[0]), 1), "y_mm": round(float(hit[1]), 1),
-                    "center_pixel": tip[0, 0].tolist()}
-    return None
-
-
-def barrel_tip(contour, mask):
-    x, y, width, height = cv2.boundingRect(contour)
-    if height < 20 or max(width, height) > .45 * max(mask.shape):
-        return None
-    silhouette = np.zeros((height, width), np.uint8)
-    cv2.drawContours(silhouette, [contour], -1, 1, cv2.FILLED, offset=(-x, -y))
-    widths = silhouette.sum(axis=1)
-    edge_y = y + height - 1
-    # A barrel has a sustained, nearly parallel pair of sides before the
-    # point. Fit a short lower window so the widest part can include a flight.
-    length = min(36, max(14, height // 3))
-    start = height - length - 3
-    if start < 0:
-        return None
-    local_rows = np.arange(start, height - 3)
-    band = widths[local_rows]
-    barrel_width = float(np.median(band))
-    if not 5 <= barrel_width <= 30 or length < 1.4 * barrel_width:
-        return None
-    if np.mean(np.abs(band - barrel_width) <= max(2, .25 * barrel_width)) < .8:
-        return None
-    centers = np.array([x + np.mean(np.flatnonzero(silhouette[row])) for row in local_rows])
-    rows = local_rows + y
-    slope, intercept = np.polyfit(rows, centers, 1)
-    if abs(slope) > 2.5 or np.max(np.abs(centers - (slope * rows + intercept))) > 2.5:
-        return None
-
-    # The point may disappear against dark sisal for a few rows. Bridge
-    # short gaps but require a narrow, aligned continuation of the barrel.
-    hits = []
-    half_width = max(4, math.ceil(barrel_width / 2) + 2)
-    for row in range(edge_y + 1, min(mask.shape[0], edge_y + max(12, min(48, height // 3)))):
-        expected = round(slope * row + intercept)
-        left, right = max(0, expected - half_width), min(mask.shape[1], expected + half_width + 1)
-        if left >= right:
-            break
-        columns = np.flatnonzero(mask[row, left:right])
-        if 0 < len(columns) <= max(2, .55 * barrel_width):
-            center = left + np.median(columns)
-            if abs(center - expected) <= 3:
-                hits.append((center, row))
-        if row - (hits[-1][1] if hits else edge_y) > 4:
-            break
-
-    # A barrel endpoint alone is not a reliable impact coordinate.
-    if len(hits) < 4:
-        return None
-    row = hits[-1][1]
-    return length + len(hits), np.float32([[[slope * row + intercept, row]]])
-
-
 def change_mask(previous, current):
     if previous.shape != current.shape:
         raise ValueError("Kameraets billedstørrelse har ændret sig.")
@@ -339,28 +259,13 @@ def change_mask(previous, current):
 
 def detect_throw(before, after, mappings):
     masks = [change_mask(previous, current)
-             for previous, current in zip(before[:2], after[:2])]
+             for previous, current in zip(before, after)]
     diagnostics = {}
-    hit = detect(masks, mappings[:2], diagnostics)
+    hit = detect(masks, mappings, diagnostics)
     if hit is not None:
         return hit
     counts = "/".join(map(str, diagnostics["line_counts"]))
     raise ValueError(f"Fandt intet fælles træfpunkt. Linjer pr. kamera: {counts}.")
-
-
-def validate_center(hit, before, after, mappings):
-    if len(mappings) < 3 or before[2] is None or after[2] is None:
-        return hit
-    try:
-        candidate = center_hit(change_mask(before[2], after[2]), mappings[2])
-    except (ValueError, cv2.error, np.linalg.LinAlgError):
-        candidate = None
-    if candidate is None:
-        return {**hit, "validation": "unconfirmed"}
-    distance = math.hypot(hit["x_mm"] - candidate["x_mm"], hit["y_mm"] - candidate["y_mm"])
-    confirmed = distance <= 18 and hit["field"] == candidate["field"]
-    return {**hit, "center_pixel": candidate["center_pixel"], "center_field": candidate["field"],
-            "validation": "confirmed" if confirmed else "disagrees"}
 
 
 def camera_selection():
@@ -369,7 +274,7 @@ def camera_selection():
 
 def require_cameras():
     if not cameras:
-        raise ValueError("Vælg og gem de tre kameraer først.")
+        raise ValueError("Vælg og gem de to kameraer først.")
 
 
 def saved_calibration():
@@ -377,7 +282,8 @@ def saved_calibration():
     if not calibration_path.exists():
         raise ValueError("Kalibrér kameraerne først.")
     saved = json.loads(calibration_path.read_text())
-    if saved.get("camera_entities") != camera_selection():
+    previous = saved.get("camera_entities", {})
+    if {role: previous.get(role) for role in camera_roles} != camera_selection():
         raise ValueError("Vælg Kalibrér 9 punkter for de valgte kameraer først.")
     return saved
 
@@ -400,7 +306,7 @@ def select_cameras():
     if any(not isinstance(value, str) or not CAMERA_ID.fullmatch(value) for value in selected.values()):
         return {"error": "Vælg et kamera til hver rolle."}, 400
     if len(set(selected.values())) != len(camera_roles):
-        return {"error": "Vælg tre forskellige kameraer."}, 400
+        return {"error": "Vælg to forskellige kameraer."}, 400
     try:
         available = {entity["id"] for entity in camera_entities() if entity["available"]}
         if not set(selected.values()) <= available:
@@ -462,8 +368,7 @@ def turn_state():
             for dart in darts:
                 position = np.float32([[[dart["x_mm"], dart["y_mm"]]]])
                 pixel = project(position, mapping, backwards=True)[0, 0]
-                markers.append({"final": pixel.tolist(),
-                                "initial": dart.get("center_pixel") if side == "third" else None})
+                markers.append(pixel.tolist())
             views[side] = markers
     return {"camera_hits": views, "darts": list(darts), "total": sum(d["points"] for d in darts),
             "status": status,
@@ -471,7 +376,7 @@ def turn_state():
 
 
 def board_is_clear(frames):
-    for baseline, frame in zip(empty_board[:2], frames[:2]):
+    for baseline, frame in zip(empty_board, frames):
         if baseline.shape != frame.shape:
             raise ValueError("Kameraets billedstørrelse har ændret sig.")
         delta = cv2.cvtColor(cv2.absdiff(baseline, frame), cv2.COLOR_BGR2GRAY)
@@ -510,7 +415,6 @@ def analyze_frames(frames):
     ) > 6:
         status = f"Bekræfter {hit['field']}."
         return
-    hit = validate_center(hit, reference, frames, mappings)
     darts.append(hit)
     reference = frames
     pending = None
@@ -550,10 +454,10 @@ def watch_board():
             if reference is None:
                 continue
             try:
-                frames = capture_pair(strict=False)
+                frames = capture_pair()
                 if pending is None and all(a.shape == b.shape and np.count_nonzero(
                     cv2.cvtColor(cv2.absdiff(a, b), cv2.COLOR_BGR2GRAY) > 30
-                ) < 180 for a, b in zip(reference[:2], frames[:2])) and darts and not clear_frames:
+                ) < 180 for a, b in zip(reference, frames)) and darts and not clear_frames:
                     pending = None
                     status = "Tur slut. Fjern pilene." if len(darts) == 3 else "Klar til næste pil."
                     continue
@@ -723,7 +627,7 @@ def auto_calibrate():
             try:
                 proposal[side] = fit_steel_wires(frame, initial)
             except (ValueError, cv2.error, np.linalg.LinAlgError) as exc:
-                name = {"left": "Venstre kamera", "right": "Højre kamera", "third": "Center Cam"}[side]
+                name = {"left": "Venstre kamera", "right": "Højre kamera"}[side]
                 warnings[side] = f"{name}: {exc}"
                 if isinstance(initial, CalibrationMesh):
                     proposal[side] = saved[side]
@@ -797,7 +701,7 @@ def act(action):
                 points = saved_calibration()
                 radius = double_inner if points.get("ring") == "inner_double" else double_outer
                 new_mappings = [transform(points[side], radius) for side in cameras]
-                frames = capture_pair(strict=False)
+                frames = capture_pair()
                 manual_mappings = new_mappings
                 mappings = new_mappings.copy()
                 next_refinement = 0

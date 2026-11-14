@@ -63,8 +63,6 @@ class EntityCamera:
         with self.lock:
             if preview and self.frame is not None and monotonic() - self.timestamp < 2:
                 return self.frame
-            # Use still images for all roles. Home Assistant can extract the
-            # still image from the center camera's stream when needed.
             self.frame = core_get("/camera_proxy/" + self.entity_id, timeout=8)
             self.timestamp = monotonic()
             return self.frame
